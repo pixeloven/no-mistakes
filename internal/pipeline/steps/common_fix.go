@@ -154,6 +154,38 @@ func commitPipelineCorrection(ctx context.Context, workDir, message string, logf
 	return commitPipelineCorrectionWithCleanup(ctx, workDir, message, logf, os.RemoveAll)
 }
 
+func commitStepCorrection(sctx *pipeline.StepContext, message string, hookFree bool) error {
+	if !hookFree {
+		policy, err := stepGitRun(sctx, "config", "--local", "--get", "--default", "", "commit.gpgsign")
+		if err != nil {
+			return err
+		}
+		args := make([]string, 0, 6)
+		if policy != "" {
+			args = append(args, "-c", "commit.gpgsign="+policy)
+		}
+		args = append(args, "commit", "-m", message)
+		_, err = stepGitRun(sctx, args...)
+		return err
+	}
+	hooksDir, err := os.MkdirTemp("", "no-mistakes-correction-hooks-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(hooksDir)
+	policy, err := stepGitRun(sctx, "config", "--local", "--get", "--default", "", "commit.gpgsign")
+	if err != nil {
+		return err
+	}
+	args := []string{"-c", "core.hooksPath=" + hooksDir}
+	if policy != "" {
+		args = append(args, "-c", "commit.gpgsign="+policy)
+	}
+	args = append(args, "commit", "--no-verify", "-m", message)
+	_, err = stepGitRun(sctx, args...)
+	return err
+}
+
 func commitPipelineCorrectionWithCleanup(
 	ctx context.Context,
 	workDir, message string,
@@ -164,7 +196,7 @@ func commitPipelineCorrectionWithCleanup(
 	if err != nil {
 		return fmt.Errorf("prepare hook-free commit environment: %w", err)
 	}
-	_, commitErr := git.Run(ctx, workDir, "-c", "core.hooksPath="+emptyHooksDir, "commit", "--no-verify", "-m", message)
+	commitErr := git.CommitWithLocalSigningPolicy(ctx, workDir, message, emptyHooksDir)
 	if cleanupErr := cleanup(emptyHooksDir); cleanupErr != nil {
 		if logf != nil {
 			logf(fmt.Sprintf("warning: failed to remove temporary hook-free commit directory %s: %v", emptyHooksDir, cleanupErr))
@@ -198,7 +230,7 @@ func commitAgentFixes(sctx *pipeline.StepContext, stepName types.StepName, summa
 	if _, err := git.Run(ctx, sctx.WorkDir, "add", "-A"); err != nil {
 		return fmt.Errorf("stage %s changes: %w", stepName, err)
 	}
-	if err := commitPipelineCorrection(ctx, sctx.WorkDir, commitMessage, sctx.Log); err != nil {
+	if err := commitStepCorrection(sctx, commitMessage, true); err != nil {
 		return fmt.Errorf("commit %s changes: %w", stepName, err)
 	}
 	headSHA, err := git.HeadSHA(ctx, sctx.WorkDir)

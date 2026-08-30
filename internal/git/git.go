@@ -586,6 +586,47 @@ func CommitAll(ctx context.Context, dir, message string) error {
 	return err
 }
 
+// LocalCommitSigningPolicy returns the explicitly configured repository-local
+// commit.gpgsign value. An empty result means the repository has not opted in
+// or out; callers must then leave normal Git configuration precedence intact.
+func LocalCommitSigningPolicy(ctx context.Context, dir string) (string, error) {
+	return Run(ctx, dir, "config", "--local", "--get", "--default", "", "commit.gpgsign")
+}
+
+// CommitWithLocalSigningPolicy creates a commit while preserving the invoking
+// repository's explicit local signing decision. Passing the value as a
+// command-local override is important for pipeline worktrees: ambient
+// GIT_CONFIG_* settings (including a maintainer's signer) must not override an
+// explicit local false, while repositories with no local policy retain normal
+// Git precedence. hookPath, when non-empty, isolates hooks for machine-owned
+// correction commits.
+func CommitWithLocalSigningPolicy(ctx context.Context, dir, message, hookPath string) error {
+	return CommitWithLocalSigningPolicyFromEnv(ctx, dir, nil, message, hookPath)
+}
+
+// CommitWithLocalSigningPolicyFromEnv is CommitWithLocalSigningPolicy with an
+// explicit subprocess environment (used by step-scoped PATH/credentials).
+func CommitWithLocalSigningPolicyFromEnv(ctx context.Context, dir string, env []string, message, hookPath string) error {
+	policyOut, err := RunWithEnv(ctx, dir, env, "config", "--local", "--get", "--default", "", "commit.gpgsign")
+	if err != nil {
+		return err
+	}
+	args := make([]string, 0, 8)
+	if policyOut != "" {
+		args = append(args, "-c", "commit.gpgsign="+policyOut)
+	}
+	if hookPath != "" {
+		args = append(args, "-c", "core.hooksPath="+hookPath)
+	}
+	args = append(args, "commit")
+	if hookPath != "" {
+		args = append(args, "--no-verify")
+	}
+	args = append(args, "-m", message)
+	_, err = RunWithEnv(ctx, dir, env, args...)
+	return err
+}
+
 // CopyLocalCommitSettings copies repository-local commit settings from srcDir
 // into dstDir. It carries user.name, user.email, and an explicitly configured
 // commit.gpgsign value. Missing values in srcDir are ignored, so ordinary Git
