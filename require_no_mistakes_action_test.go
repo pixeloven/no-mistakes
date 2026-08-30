@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,6 +94,10 @@ type actionRun struct {
 	exemptBots  string
 	exemptRefs  string
 	eventPath   string
+	eventName   string
+	repository  string
+	apiURL      string
+	ref         string
 }
 
 type actionResult struct {
@@ -119,6 +125,10 @@ func runRequireAction(t *testing.T, run actionRun) actionResult {
 		"NM_EXEMPT_BOT_AUTHORS="+run.exemptBots,
 		"NM_EXEMPT_HEAD_BRANCHES="+run.exemptRefs,
 		"GITHUB_EVENT_PATH="+run.eventPath,
+		"GITHUB_EVENT_NAME="+run.eventName,
+		"GITHUB_REPOSITORY="+run.repository,
+		"GITHUB_API_URL="+run.apiURL,
+		"GITHUB_REF="+run.ref,
 		"GITHUB_OUTPUT="+outputFile,
 	)
 	var buf bytes.Buffer
@@ -401,6 +411,27 @@ func TestRequireActionExemptions(t *testing.T) {
 // TestRequireActionReadsTheEventPayloadWhenInputsAreOmitted is what keeps a
 // caller thin: a pull_request-triggered workflow forwards nothing and the
 // action still binds the attestation to the real PR head.
+func TestRequireActionSynchronizeSettlesAgainstCurrentPRSnapshot(t *testing.T) {
+	compliant := pipelineSummaryWithStatuses(t, types.StepStatusCompleted, types.StepStatusCompleted, types.StepStatusCompleted)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/test/repo/pulls/42" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"number":42,"body":` + mustJSONString(t, compliant) + `,"head":{"sha":"` + requiredWorkflowTestHeadSHA + `","ref":"feature"},"user":{"login":"contributor"}}`))
+	}))
+	defer server.Close()
+	eventPath := filepath.Join(t.TempDir(), "event.json")
+	if err := os.WriteFile(eventPath, []byte(`{"action":"synchronize","pull_request":{"number":42,"body":"old body","head":{"sha":"`+requiredWorkflowTestHeadSHA+`","ref":"feature"},"user":{"login":"contributor"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := runRequireAction(t, actionRun{eventPath: eventPath, eventName: "pull_request", repository: "test/repo", apiURL: server.URL})
+	if got.conclusion != "success" {
+		t.Fatalf("synchronize event should judge the current PR snapshot, got %s\n%s", got.conclusion, got.output)
+	}
+}
+
 func TestRequireActionReadsTheEventPayloadWhenInputsAreOmitted(t *testing.T) {
 	compliant := pipelineSummaryWithStatuses(t, types.StepStatusCompleted, types.StepStatusCompleted, types.StepStatusCompleted)
 	eventPath := filepath.Join(t.TempDir(), "event.json")

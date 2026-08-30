@@ -142,18 +142,9 @@ func evaluateRequiredWorkflowAuthorCondition(condition, author string) (bool, er
 // re-runs when the PR body is edited so a contributor cannot bypass by opening
 // clean then editing the body.
 //
-// It also pins the deliberate absence of "synchronize". A push never changes
-// the PR body, and the pipeline pushes (Push step) before it writes the
-// deterministic "## Pipeline" section (PR step), so on any PR whose body is not
-// yet compliant - every PR the pipeline adopts rather than opens itself - the
-// synchronize run pins a FAILURE check run to the new head for a body the same
-// run is about to fix. GitHub keeps that failure alongside the later `edited`
-// SUCCESS instead of replacing it, and `gh pr checks` collapses same-named
-// check runs by startedAt alone, so the pipeline's own CI monitor can read the
-// stale failure and park the run red with no push able to clear it (PR #773
-// carried check runs 96017425510 FAILURE and 96017420271 SUCCESS on one head).
-// Body-bearing events still bind attestation.head_sha to the PR head at that
-// event. No ruleset requires this status, so no head SHA needs a run of its own.
+// The self-check remains on the immutable published action pin until a
+// deliberate pin-bump migration. Its body-bearing trigger set is unchanged;
+// the reusable action's synchronize contract is covered independently.
 func TestNoMistakesRequiredWorkflowTriggersOnRelevantPREvents(t *testing.T) {
 	types := requiredWorkflowPullRequestTypes(t, loadRequiredWorkflow(t))
 
@@ -163,7 +154,7 @@ func TestNoMistakesRequiredWorkflowTriggersOnRelevantPREvents(t *testing.T) {
 		}
 	}
 	if slices.Contains(types, "synchronize") {
-		t.Errorf("workflow must not judge PR-body compliance on synchronize, got %v", types)
+		t.Errorf("self-check must stay on its published pinned action trigger set, got %v", types)
 	}
 }
 
