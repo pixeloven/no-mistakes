@@ -1397,6 +1397,18 @@ func (e *Executor) failRun(run *db.Run, repo *db.Repo, err error, ctxs ...contex
 		runStatus = types.RunCancelled
 	}
 	verifiedHead, verified := e.reconcileTerminalRunHead(run)
+	// Even when the live worktree cannot be proven as a descendant (for
+	// example, a correction commit failed after the authoritative head was
+	// recorded), keep that recorded implementation reachable. This is the
+	// custody anchor recovery needs; it does not bless the live worktree or
+	// mark terminal head evidence verified.
+	if !verified {
+		e.preserveRecordedTerminalHead(run)
+	}
+	// The managed worktree is removed after terminalization; anchor the
+	// authoritative recorded head in the shared gate as well so custody
+	// recovery does not depend on that ephemeral checkout surviving.
+	e.preserveTerminalHeadInGate(run, repo)
 	var dbErr error
 	if verified {
 		dbErr = e.db.UpdateRunErrorStatusWithVerifiedHead(run.ID, errMsg, runStatus, verifiedHead)
@@ -1471,6 +1483,58 @@ func (e *Executor) reconcileTerminalRunHead(run *db.Run) (string, bool) {
 		return "", false
 	}
 	return observed, true
+}
+
+func (e *Executor) preserveTerminalHeadInGate(run *db.Run, repo *db.Repo) bool {
+	if e == nil || e.paths == nil || run == nil || repo == nil || strings.TrimSpace(run.HeadSHA) == "" {
+		return false
+	}
+	published := ""
+	if run.LastPushedSHA != nil {
+		published = *run.LastPushedSHA
+	}
+	if published == "" && run.SubmittedHeadSHA != nil {
+		published = *run.SubmittedHeadSHA
+	}
+	if run.HeadSHA == published {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := git.Run(ctx, e.workDir, "cat-file", "-e", run.HeadSHA+"^{commit}"); err != nil {
+		return false
+	}
+	if err := custody.PreserveRecoveryHead(ctx, e.paths.RepoDir(repo.ID), run.ID, run.HeadSHA); err != nil {
+		slog.Warn("failed to anchor terminal head in gate", "run", run.ID, "head", run.HeadSHA, "error", err)
+		return false
+	}
+	return true
+}
+
+func (e *Executor) preserveRecordedTerminalHead(run *db.Run) bool {
+	if run == nil || strings.TrimSpace(e.workDir) == "" || strings.TrimSpace(run.HeadSHA) == "" {
+		return false
+	}
+	published := ""
+	if run.LastPushedSHA != nil {
+		published = *run.LastPushedSHA
+	}
+	if published == "" && run.SubmittedHeadSHA != nil {
+		published = *run.SubmittedHeadSHA
+	}
+	if run.HeadSHA == published {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := git.Run(ctx, e.workDir, "cat-file", "-e", run.HeadSHA+"^{commit}"); err != nil {
+		return false
+	}
+	if err := custody.PreserveRecoveryHead(ctx, e.workDir, run.ID, run.HeadSHA); err != nil {
+		slog.Warn("failed to anchor recorded terminal head", "run", run.ID, "head", run.HeadSHA, "error", err)
+		return false
+	}
+	return true
 }
 
 func (e *Executor) preserveUnpublishedTerminalHead(ctx context.Context, run *db.Run, head string) bool {
