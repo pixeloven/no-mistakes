@@ -55,12 +55,18 @@ func runVerifyPy(t *testing.T, body, headSHA string) (conclusion, output string)
 		t.Fatalf("seed GITHUB_OUTPUT: %v", err)
 	}
 	cmd := exec.Command(python, verifyPyRelPath)
-	cmd.Env = append(os.Environ(),
+	// Verify.py has event-aware synchronize handling. These round-trip tests
+	// exercise the pure body/head contract and must not inherit the parent
+	// GitHub Actions event (which may itself be synchronize) into the child.
+	env := os.Environ()
+	env = append(env, "GITHUB_EVENT_NAME=", "GITHUB_EVENT_PATH=")
+	env = append(env,
 		"PR_BODY="+body,
 		"PR_HEAD_SHA="+headSHA,
 		"PR_NUMBER=42",
 		"GITHUB_OUTPUT="+outputFile,
 	)
+	cmd.Env = env
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
