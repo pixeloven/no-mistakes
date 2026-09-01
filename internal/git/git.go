@@ -790,13 +790,53 @@ func commitSigningPolicyPath(ctx context.Context, dir string) (string, error) {
 
 func RequireWorktreeCommitSettings(ctx context.Context, dir string) error {
 	_, err := Run(ctx, dir, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
-	if err == nil {
-		return nil
-	}
-	if WorktreeConfigUnavailable(err) {
+	if err != nil && WorktreeConfigUnavailable(err) {
 		return fmt.Errorf("concurrent autonomous runs require Git worktree configuration; upgrade Git to a version supporting git config --worktree and reinitialize the gate: %w", err)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	linked, err := isLinkedWorktree(ctx, dir)
+	if err != nil || !linked {
+		return err
+	}
+	for _, key := range []string{"commit.gpgsign", "user.name", "user.email"} {
+		const absent = "no-mistakes:config-key-absent"
+		value, err := Run(ctx, dir, "config", "--local", "--get", "--default", absent, key)
+		if err != nil {
+			return err
+		}
+		if value != absent {
+			return fmt.Errorf("concurrent autonomous runs require isolated worktree commit settings; shared gate config contains %s; reinitialize the gate before retrying", key)
+		}
+	}
+	return nil
+}
+
+func isLinkedWorktree(ctx context.Context, dir string) (bool, error) {
+	gitDir, err := Run(ctx, dir, "rev-parse", "--git-dir")
+	if err != nil {
+		return false, err
+	}
+	commonDir, err := Run(ctx, dir, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return false, err
+	}
+	resolve := func(path string) string {
+		if filepath.IsAbs(path) {
+			return filepath.Clean(path)
+		}
+		return filepath.Clean(filepath.Join(dir, path))
+	}
+	gitInfo, err := os.Stat(resolve(gitDir))
+	if err != nil {
+		return false, err
+	}
+	commonInfo, err := os.Stat(resolve(commonDir))
+	if err != nil {
+		return false, err
+	}
+	return !os.SameFile(gitInfo, commonInfo), nil
 }
 
 // WorktreeConfigUnavailable reports whether `git config --worktree` cannot be

@@ -285,6 +285,8 @@ func TestCopyLocalCommitSettings_IsolatesConcurrentSigningPolicies(t *testing.T)
 	run(t, dst, "git", "config", "extensions.worktreeConfig", "true")
 	run(t, dst, "git", "config", "--worktree", "core.bare", "false")
 	run(t, dst, "git", "config", "--local", "--unset-all", "core.bare")
+	run(t, dst, "git", "config", "--local", "--unset-all", "user.name")
+	run(t, dst, "git", "config", "--local", "--unset-all", "user.email")
 	linkedA := filepath.Join(t.TempDir(), "linked-a")
 	linkedB := filepath.Join(t.TempDir(), "linked-b")
 	run(t, dst, "git", "worktree", "add", "--detach", linkedA, "HEAD")
@@ -337,6 +339,36 @@ func TestCopyLocalCommitSettings_RejectsSharedConfigFallback(t *testing.T) {
 	err := CopyLocalCommitSettings(ctx, src, linkedA)
 	if err == nil || !strings.Contains(err.Error(), "upgrade Git") || !strings.Contains(err.Error(), "worktree configuration") {
 		t.Fatalf("unsupported worktree config error = %v", err)
+	}
+}
+
+func TestCopyLocalCommitSettings_RejectsLegacySharedCommitSettings(t *testing.T) {
+	for _, setting := range []struct {
+		key   string
+		value string
+	}{
+		{key: "commit.gpgsign", value: "false"},
+		{key: "user.name", value: "Legacy Name"},
+		{key: "user.email", value: "legacy@example.com"},
+	} {
+		t.Run(setting.key, func(t *testing.T) {
+			ctx := context.Background()
+			src := initTestRepo(t)
+			dst := initTestRepo(t)
+			run(t, dst, "git", "config", "extensions.worktreeConfig", "true")
+			run(t, dst, "git", "config", "--worktree", "core.bare", "false")
+			run(t, dst, "git", "config", "--local", "--unset-all", "core.bare")
+			run(t, dst, "git", "config", "--local", "--unset-all", "user.name")
+			run(t, dst, "git", "config", "--local", "--unset-all", "user.email")
+			run(t, dst, "git", "config", "--local", setting.key, setting.value)
+			linked := filepath.Join(t.TempDir(), "linked")
+			run(t, dst, "git", "worktree", "add", "--detach", linked, "HEAD")
+
+			err := CopyLocalCommitSettings(ctx, src, linked)
+			if err == nil || !strings.Contains(err.Error(), setting.key) || !strings.Contains(err.Error(), "reinitialize the gate") {
+				t.Fatalf("legacy shared setting admission error = %v", err)
+			}
+		})
 	}
 }
 
