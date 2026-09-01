@@ -83,7 +83,7 @@ func runInDirWithEnv(ctx context.Context, dir string, extraEnv []string, args ..
 }
 
 func runInDirWithEnvRaw(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, gitExecutableFromEnv(dir, extraEnv), args...)
 	cmd.Dir = dir
 	cmd.Env = append(nonInteractiveEnvForContext(ctx, dir), extraEnv...)
 	winproc.Harden(cmd)
@@ -101,6 +101,26 @@ func runInDirWithEnvRaw(ctx context.Context, dir string, extraEnv []string, args
 		return nil, fmt.Errorf("git %s: %w: %s", safeurl.RedactText(strings.Join(args, " ")), err, safeurl.RedactText(strings.TrimSpace(stderr.String())))
 	}
 	return out, nil
+}
+
+func gitExecutableFromEnv(dir string, env []string) string {
+	pathValue, ok := environmentSliceValue(env, "PATH")
+	if !ok {
+		return "git"
+	}
+	for _, pathDir := range filepath.SplitList(pathValue) {
+		if pathDir == "" {
+			pathDir = "."
+		}
+		if !filepath.IsAbs(pathDir) {
+			pathDir = filepath.Join(dir, pathDir)
+		}
+		candidate := filepath.Join(pathDir, "git")
+		if executable, err := exec.LookPath(candidate); err == nil {
+			return executable
+		}
+	}
+	return filepath.Join(dir, ".no-mistakes-missing-git")
 }
 
 // ValidateBareRepository verifies both the filesystem shape and Git's own bare
@@ -601,8 +621,8 @@ type commitConfigEntry struct {
 	value string
 }
 
-func localCommitPolicyEntries(ctx context.Context, dir string, _ []string) ([]commitConfigEntry, error) {
-	if err := RequireWorktreeCommitSettings(ctx, dir); err != nil {
+func localCommitPolicyEntries(ctx context.Context, dir string, env []string) ([]commitConfigEntry, error) {
+	if err := requireWorktreeCommitSettingsWithEnv(ctx, dir, env); err != nil {
 		return nil, err
 	}
 	policy, ok := ctx.Value(commitPolicyContextKey{}).(CommitPolicy)
@@ -623,7 +643,11 @@ func localCommitPolicyEntries(ctx context.Context, dir string, _ []string) ([]co
 }
 
 func LocalCommitPolicyArgs(ctx context.Context, dir string) ([]string, error) {
-	entries, err := localCommitPolicyEntries(ctx, dir, nil)
+	return LocalCommitPolicyArgsFromEnv(ctx, dir, nil)
+}
+
+func LocalCommitPolicyArgsFromEnv(ctx context.Context, dir string, env []string) ([]string, error) {
+	entries, err := localCommitPolicyEntries(ctx, dir, env)
 	if err != nil {
 		return nil, err
 	}
@@ -806,19 +830,23 @@ func explicitRepositoryCommitSigningPolicy(ctx context.Context, dir string) (str
 }
 
 func RequireWorktreeCommitSettings(ctx context.Context, dir string) error {
-	_, err := Run(ctx, dir, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
+	return requireWorktreeCommitSettingsWithEnv(ctx, dir, nil)
+}
+
+func requireWorktreeCommitSettingsWithEnv(ctx context.Context, dir string, env []string) error {
+	_, err := RunWithEnv(ctx, dir, env, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
 	if err != nil && WorktreeConfigUnavailable(err) {
 		return fmt.Errorf("concurrent autonomous runs require Git worktree configuration; upgrade Git to a version supporting git config --worktree and reinitialize the gate: %w", err)
 	}
 	if err != nil {
 		return err
 	}
-	linked, err := isLinkedWorktree(ctx, dir)
+	linked, err := isLinkedWorktreeWithEnv(ctx, dir, env)
 	if err != nil || !linked {
 		return err
 	}
 	for _, key := range []string{"commit.gpgsign", "user.name", "user.email"} {
-		present, err := configValuePresentAtScope(ctx, dir, "--local", key)
+		present, err := configValuePresentAtScopeWithEnv(ctx, dir, env, "--local", key)
 		if err != nil {
 			return err
 		}
@@ -846,7 +874,11 @@ func ClearLegacySharedCommitSettings(ctx context.Context, dir string) error {
 }
 
 func configValuePresentAtScope(ctx context.Context, dir, scope, key string) (bool, error) {
-	_, err := Run(ctx, dir, "config", scope, "--get", key)
+	return configValuePresentAtScopeWithEnv(ctx, dir, nil, scope, key)
+}
+
+func configValuePresentAtScopeWithEnv(ctx context.Context, dir string, env []string, scope, key string) (bool, error) {
+	_, err := RunWithEnv(ctx, dir, env, "config", scope, "--get", key)
 	if err == nil {
 		return true, nil
 	}
@@ -858,11 +890,15 @@ func configValuePresentAtScope(ctx context.Context, dir, scope, key string) (boo
 }
 
 func isLinkedWorktree(ctx context.Context, dir string) (bool, error) {
-	gitDir, err := Run(ctx, dir, "rev-parse", "--git-dir")
+	return isLinkedWorktreeWithEnv(ctx, dir, nil)
+}
+
+func isLinkedWorktreeWithEnv(ctx context.Context, dir string, env []string) (bool, error) {
+	gitDir, err := RunWithEnv(ctx, dir, env, "rev-parse", "--git-dir")
 	if err != nil {
 		return false, err
 	}
-	commonDir, err := Run(ctx, dir, "rev-parse", "--git-common-dir")
+	commonDir, err := RunWithEnv(ctx, dir, env, "rev-parse", "--git-common-dir")
 	if err != nil {
 		return false, err
 	}
