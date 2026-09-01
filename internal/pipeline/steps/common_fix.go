@@ -155,15 +155,15 @@ func commitPipelineCorrection(ctx context.Context, workDir, message string, logf
 }
 
 func commitStepCorrection(sctx *pipeline.StepContext, message string, hookFree bool) error {
+	policy, err := stepGitRun(sctx, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
+	if err != nil {
+		return err
+	}
+	args := make([]string, 0, 8)
+	if policy != "" {
+		args = append(args, "-c", "commit.gpgsign="+policy)
+	}
 	if !hookFree {
-		policy, err := stepGitRun(sctx, "config", "--local", "--get", "--default", "", "commit.gpgsign")
-		if err != nil {
-			return err
-		}
-		args := make([]string, 0, 6)
-		if policy != "" {
-			args = append(args, "-c", "commit.gpgsign="+policy)
-		}
 		args = append(args, "commit", "-m", message)
 		_, err = stepGitRun(sctx, args...)
 		return err
@@ -173,15 +173,7 @@ func commitStepCorrection(sctx *pipeline.StepContext, message string, hookFree b
 		return err
 	}
 	defer os.RemoveAll(hooksDir)
-	policy, err := stepGitRun(sctx, "config", "--local", "--get", "--default", "", "commit.gpgsign")
-	if err != nil {
-		return err
-	}
-	args := []string{"-c", "core.hooksPath=" + hooksDir}
-	if policy != "" {
-		args = append(args, "-c", "commit.gpgsign="+policy)
-	}
-	args = append(args, "commit", "--no-verify", "-m", message)
+	args = append(args, "-c", "core.hooksPath="+hooksDir, "commit", "--no-verify", "-m", message)
 	_, err = stepGitRun(sctx, args...)
 	return err
 }

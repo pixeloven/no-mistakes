@@ -586,11 +586,11 @@ func CommitAll(ctx context.Context, dir, message string) error {
 	return err
 }
 
-// LocalCommitSigningPolicy returns the explicitly configured repository-local
+// LocalCommitSigningPolicy returns the explicitly configured worktree-local
 // commit.gpgsign value. An empty result means the repository has not opted in
 // or out; callers must then leave normal Git configuration precedence intact.
 func LocalCommitSigningPolicy(ctx context.Context, dir string) (string, error) {
-	return Run(ctx, dir, "config", "--local", "--get", "--default", "", "commit.gpgsign")
+	return Run(ctx, dir, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
 }
 
 // CommitWithLocalSigningPolicy creates a commit while preserving the invoking
@@ -607,7 +607,7 @@ func CommitWithLocalSigningPolicy(ctx context.Context, dir, message, hookPath st
 // CommitWithLocalSigningPolicyFromEnv is CommitWithLocalSigningPolicy with an
 // explicit subprocess environment (used by step-scoped PATH/credentials).
 func CommitWithLocalSigningPolicyFromEnv(ctx context.Context, dir string, env []string, message, hookPath string) error {
-	policyOut, err := RunWithEnv(ctx, dir, env, "config", "--local", "--get", "--default", "", "commit.gpgsign")
+	policyOut, err := RunWithEnv(ctx, dir, env, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
 	if err != nil {
 		return err
 	}

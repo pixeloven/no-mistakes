@@ -625,12 +625,18 @@ func TestCommitAgentFixes_PersistsUncertifiedRangeForReview(t *testing.T) {
 
 func TestCommitAgentFixes_HonorsExplicitLocalUnsignedPolicy(t *testing.T) {
 	t.Parallel()
-	dir, baseSHA, _ := setupGitRepo(t)
-	// Simulate the operator's ambient signer being unavailable while the
-	// invoking repository explicitly opts out of signing.
-	gitCmd(t, dir, "config", "commit.gpgsign", "false")
-	gitCmd(t, dir, "config", "gpg.program", filepath.Join(t.TempDir(), "missing-signer"))
-	gitCmd(t, dir, "config", "user.signingkey", "unavailable-key")
+	sourceDir, _, _ := setupGitRepo(t)
+	gitCmd(t, sourceDir, "config", "commit.gpgsign", "false")
+	gateDir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, gateDir, "config", "extensions.worktreeConfig", "true")
+	workDir := filepath.Join(t.TempDir(), "gate-worktree")
+	gitCmd(t, gateDir, "worktree", "add", "--detach", workDir, headSHA)
+	if err := git.CopyLocalCommitSettings(context.Background(), sourceDir, workDir); err != nil {
+		t.Fatalf("CopyLocalCommitSettings: %v", err)
+	}
+	if got := gitCmd(t, workDir, "config", "--worktree", "--get", "commit.gpgsign"); got != "false" {
+		t.Fatalf("worktree commit.gpgsign = %q, want false", got)
+	}
 
 	ag := &mockAgent{
 		name: "test",
@@ -641,12 +647,21 @@ func TestCommitAgentFixes_HonorsExplicitLocalUnsignedPolicy(t *testing.T) {
 			return &agent.Result{Output: json.RawMessage(`{"summary":"apply unsigned fix"}`)}, nil
 		},
 	}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, gitCmd(t, dir, "rev-parse", "HEAD"), config.Commands{})
+	sctx := newTestContextWithDBRecords(t, ag, workDir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = []string{
+		"GIT_CONFIG_COUNT=3",
+		"GIT_CONFIG_KEY_0=commit.gpgsign",
+		"GIT_CONFIG_VALUE_0=true",
+		"GIT_CONFIG_KEY_1=gpg.program",
+		"GIT_CONFIG_VALUE_1=" + filepath.Join(t.TempDir(), "missing-signer"),
+		"GIT_CONFIG_KEY_2=user.signingkey",
+		"GIT_CONFIG_VALUE_2=unavailable-key",
+	}
 	sctx.Fixing = true
 	if _, err := executeFixMode(sctx, types.StepReview, fixExecutionOptions{FallbackSummary: "apply unsigned fix"}); err != nil {
 		t.Fatalf("executeFixMode: %v", err)
 	}
-	commit := gitCmd(t, dir, "cat-file", "commit", "HEAD")
+	commit := gitCmd(t, workDir, "cat-file", "commit", "HEAD")
 	if strings.Contains(commit, "\\ngpgsig ") || strings.HasPrefix(commit, "gpgsig ") {
 		t.Fatalf("correction commit unexpectedly contains a signature:\\n%s", commit)
 	}
