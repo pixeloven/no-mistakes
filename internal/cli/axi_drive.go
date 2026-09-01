@@ -294,6 +294,11 @@ func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSt
 	if opt := formatIntentPushOption(intent); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
+	worktree, err := git.FindGitRoot(".")
+	if err != nil {
+		return "", fmt.Errorf("resolve initiating worktree: %w", err)
+	}
+	pushOptions = append(pushOptions, formatWorktreePushOption(worktree))
 	priorRunIDs, err := runIDsForHead(env.client, env.repo.ID, branch, headSHA)
 	if err != nil {
 		// An active run can still be found below. Without a baseline, however,
@@ -323,7 +328,7 @@ func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSt
 	// No run appeared: the push was likely up-to-date. Rerun the latest gate
 	// head so `axi run` is still useful when there are no new commits.
 	var rr ipc.RerunResult
-	if err := env.client.Call(ipc.MethodRerun, rerunParams(env.repo.ID, branch, skipSteps, intent), &rr); err != nil {
+	if err := env.client.Call(ipc.MethodRerun, rerunParams(env.repo.ID, branch, worktree, skipSteps, intent), &rr); err != nil {
 		return "", fmt.Errorf("no run started for %q: %v", branch, err)
 	}
 	return rr.RunID, nil
@@ -407,8 +412,8 @@ func activeRunLookupParams(repoID, branch string) *ipc.GetActiveRunParams {
 	return &ipc.GetActiveRunParams{RepoID: repoID, Branch: branch}
 }
 
-func rerunParams(repoID, branch string, skipSteps []types.StepName, intent string) *ipc.RerunParams {
-	return &ipc.RerunParams{RepoID: repoID, Branch: branch, SkipSteps: skipSteps, Intent: intent}
+func rerunParams(repoID, branch, worktree string, skipSteps []types.StepName, intent string) *ipc.RerunParams {
+	return &ipc.RerunParams{RepoID: repoID, Branch: branch, Worktree: worktree, SkipSteps: skipSteps, Intent: intent}
 }
 
 // driveRun subscribes to a run and reconciles authoritative state on transition

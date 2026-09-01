@@ -725,7 +725,11 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 	}
 
 	branch := branchFromRef(params.Ref)
-	return m.startRun(ctx, repo, branch, params.New, params.Old, "push", params.SkipSteps, params.Intent)
+	policySource, err := resolveCommitPolicySource(ctx, repo, params.Worktree, branch, params.New)
+	if err != nil {
+		return "", err
+	}
+	return m.startRunWithIntentSourceAndPolicy(ctx, repo, branch, params.New, params.Old, "push", params.SkipSteps, params.Intent, db.RunIntentSourceAgent, policySource)
 }
 
 // HandleRerun creates a new run for the latest recoverable head on a branch:
@@ -734,6 +738,10 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 // selected run. Otherwise an authoritative intent is inherited byte-for-byte;
 // runs without one infer intent afresh.
 func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRunID string, skipSteps []types.StepName, intent string) (string, error) {
+	return m.handleRerunFromWorktree(ctx, repoID, branch, previousRunID, "", skipSteps, intent)
+}
+
+func (m *RunManager) handleRerunFromWorktree(ctx context.Context, repoID, branch, previousRunID, sourceWorktree string, skipSteps []types.StepName, intent string) (string, error) {
 	repo, err := m.db.GetRepo(repoID)
 	if err != nil {
 		return "", fmt.Errorf("get repo: %w", err)
@@ -803,7 +811,77 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 		}
 	}
 
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource)
+	policySource, err := resolveCommitPolicySource(ctx, repo, sourceWorktree, branch, headSHA)
+	if err != nil {
+		return "", err
+	}
+	return m.startRunWithIntentSourceAndPolicy(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, policySource)
+}
+
+func resolveCommitPolicySource(ctx context.Context, repo *db.Repo, supplied, branch, headSHA string) (string, error) {
+	validate := func(candidate string) (string, error) {
+		root, err := git.FindGitRoot(candidate)
+		if err != nil {
+			return "", fmt.Errorf("resolve initiating worktree: %w", err)
+		}
+		mainRoot, err := git.FindMainRepoRoot(root)
+		if err != nil {
+			return "", fmt.Errorf("resolve initiating repository: %w", err)
+		}
+		if worktrees.Canonical(mainRoot) != worktrees.Canonical(repo.WorkingPath) {
+			return "", fmt.Errorf("initiating worktree %s does not belong to registered repository", root)
+		}
+		return root, nil
+	}
+
+	if strings.TrimSpace(supplied) != "" {
+		return validate(supplied)
+	}
+
+	out, err := git.Run(ctx, repo.WorkingPath, "worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return "", fmt.Errorf("list initiating worktrees: %w", err)
+	}
+	type worktreeEntry struct {
+		path   string
+		head   string
+		branch string
+	}
+	var entries []worktreeEntry
+	current := worktreeEntry{}
+	flush := func() {
+		if current.path != "" {
+			entries = append(entries, current)
+		}
+		current = worktreeEntry{}
+	}
+	for _, field := range strings.Split(out, "\x00") {
+		switch {
+		case field == "":
+			flush()
+		case strings.HasPrefix(field, "worktree "):
+			current.path = strings.TrimPrefix(field, "worktree ")
+		case strings.HasPrefix(field, "HEAD "):
+			current.head = strings.TrimPrefix(field, "HEAD ")
+		case strings.HasPrefix(field, "branch refs/heads/"):
+			current.branch = strings.TrimPrefix(field, "branch refs/heads/")
+		}
+	}
+	flush()
+
+	var matches []string
+	for _, entry := range entries {
+		if entry.branch == branch && entry.head == headSHA {
+			matches = append(matches, entry.path)
+		}
+	}
+	if len(matches) == 1 {
+		return validate(matches[0])
+	}
+	if len(entries) == 1 {
+		return validate(entries[0].path)
+	}
+	return "", fmt.Errorf("cannot identify the initiating worktree for branch %s at %s; retry from that worktree with no-mistakes axi run or no-mistakes rerun", branch, headSHA)
 }
 
 func resolveRerunHead(ctx context.Context, gateDir, branch string, latest *db.Run) (string, error) {
@@ -872,6 +950,10 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 // when no intent is supplied, RunIntentSourceAgent for a new explicit
 // override, and RunIntentSourceRerun for inherited explicit intent.
 func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source string) (string, error) {
+	return m.startRunWithIntentSourceAndPolicy(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, source, repo.WorkingPath)
+}
+
+func (m *RunManager) startRunWithIntentSourceAndPolicy(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, policySource string) (string, error) {
 	branchRole := telemetryBranchRole(branch, repo.DefaultBranch)
 	trackStartFailure := func(stage string) {
 		telemetry.Track("run", telemetry.Fields{
@@ -977,7 +1059,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		}
 	}()
 
-	commitPolicy, err := git.CaptureLocalCommitSettings(ctx, repo.WorkingPath, wtDir)
+	commitPolicy, err := git.CaptureLocalCommitSettings(ctx, policySource, wtDir)
 	if err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure worktree git commit settings: %s", err))
 		trackStartFailure("configure_worktree_identity")

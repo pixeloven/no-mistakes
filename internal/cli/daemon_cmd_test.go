@@ -109,3 +109,14 @@ func TestParseIntentPushOptionsNone(t *testing.T) {
 		t.Fatalf("parseIntentPushOptions(no intent) = %q, want empty", got)
 	}
 }
+
+func TestWorktreePushOptionRoundTrip(t *testing.T) {
+	worktree := filepath.Join(t.TempDir(), "linked worktree")
+	got, err := parseWorktreePushOptions([]string{formatWorktreePushOption(worktree)})
+	if err != nil {
+		t.Fatalf("parseWorktreePushOptions() error = %v", err)
+	}
+	if got != worktree {
+		t.Fatalf("worktree round-trip = %q, want %q", got, worktree)
+	}
+}

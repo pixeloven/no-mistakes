@@ -71,6 +71,7 @@ type PushReceivedParams struct {
 	Ref       string           `json:"ref"`
 	Old       string           `json:"old"`
 	New       string           `json:"new"`
+	Worktree  string           `json:"worktree,omitempty"`
 	SkipSteps []types.StepName `json:"skip_steps,omitempty"`
 	Intent    string           `json:"intent,omitempty"`
 }
@@ -128,6 +129,7 @@ type RerunParams struct {
 	RepoID        string           `json:"repo_id"`
 	Branch        string           `json:"branch"`
 	PreviousRunID string           `json:"previous_run_id,omitempty"`
+	Worktree      string           `json:"worktree,omitempty"`
 	SkipSteps     []types.StepName `json:"skip_steps,omitempty"`
 	Intent        string           `json:"intent,omitempty"`
 }

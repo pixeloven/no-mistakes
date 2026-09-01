@@ -23,6 +23,75 @@ import (
 
 // --- RunManager integration tests ---
 
+func TestResolveCommitPolicySourceUsesMatchingLinkedWorktree(t *testing.T) {
+	mainWorktree := filepath.Join(t.TempDir(), "main")
+	linkedWorktree := filepath.Join(t.TempDir(), "feature")
+	if err := os.MkdirAll(mainWorktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, mainWorktree, "init")
+	gitCmd(t, mainWorktree, "config", "user.email", "test@example.com")
+	gitCmd(t, mainWorktree, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(mainWorktree, "file.txt"), []byte("content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, mainWorktree, "add", "file.txt")
+	gitCmd(t, mainWorktree, "commit", "-m", "initial")
+	gitCmd(t, mainWorktree, "worktree", "add", "-b", "feature", linkedWorktree)
+	headSHA := gitOutput(t, linkedWorktree, "rev-parse", "HEAD")
+
+	got, err := resolveCommitPolicySource(context.Background(), &db.Repo{WorkingPath: mainWorktree}, "", "feature", headSHA)
+	if err != nil {
+		t.Fatalf("resolveCommitPolicySource: %v", err)
+	}
+	want, err := git.FindGitRoot(linkedWorktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("policy source = %q, want linked worktree %q", got, want)
+	}
+}
+
+func TestPushReceivedCapturesInitiatingLinkedWorktreePolicy(t *testing.T) {
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+	})
+	repo, headSHA := setupTestGitRepo(t, p, d, "linked-policy-repo")
+	gitCmd(t, repo.WorkingPath, "config", "extensions.worktreeConfig", "true")
+	linkedWorktree := filepath.Join(t.TempDir(), "feature")
+	gitCmd(t, repo.WorkingPath, "worktree", "add", "-b", "feature", linkedWorktree)
+	gitCmd(t, linkedWorktree, "config", "--worktree", "commit.gpgsign", "true")
+	gitCmd(t, linkedWorktree, "push", "gate", "HEAD:refs/heads/feature")
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var result ipc.PushReceivedResult
+	if err := client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate:     p.RepoDir(repo.ID),
+		Ref:      "refs/heads/feature",
+		Old:      "0000000000000000000000000000000000000000",
+		New:      headSHA,
+		Worktree: linkedWorktree,
+	}, &result); err != nil {
+		t.Fatal(err)
+	}
+	run := waitForRunTerminalState(t, d, result.RunID)
+	if run.CommitPolicyJSON == nil {
+		t.Fatal("commit policy was not persisted")
+	}
+	policy, err := git.DecodeCommitPolicy(*run.CommitPolicyJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Signing != "true" {
+		t.Fatalf("captured signing policy = %q, want true", policy.Signing)
+	}
+}
+
 func TestValidateRecoveredSessionProviders_RejectsUnavailableFixerProvider(t *testing.T) {
 	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {

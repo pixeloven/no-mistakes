@@ -240,7 +240,8 @@ func runWizardWithMode(ctx context.Context, p *paths.Paths, state *repoState, sk
 			return git.CommitAll(ctx, workDir, msg)
 		},
 		Push: func(ctx context.Context, branch string) error {
-			return git.PushWithOptions(ctx, workDir, gate.RemoteName, "refs/heads/"+branch, "", false, formatSkipPushOptions(skipSteps))
+			pushOptions := append(formatSkipPushOptions(skipSteps), formatWorktreePushOption(workDir))
+			return git.PushWithOptions(ctx, workDir, gate.RemoteName, "refs/heads/"+branch, "", false, pushOptions)
 		},
 		SuggestBranch: func(ctx context.Context) (string, error) {
 			return suggester.suggestBranch(ctx)

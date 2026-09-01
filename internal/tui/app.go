@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/kunchenguid/no-mistakes/internal/branchsync"
 	"github.com/kunchenguid/no-mistakes/internal/cimonitor"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -20,6 +21,7 @@ type Model struct {
 	events         <-chan ipc.Event
 	cancelSub      func()
 	runID          string
+	worktree       string
 	subscriptionID uint64
 
 	// State.
@@ -492,6 +494,7 @@ func (m *Model) refreshCachedSync() {
 func Run(socketPath string, client *ipc.Client, run *ipc.RunInfo, latestVersion string) error {
 	model := NewModel(socketPath, client, run)
 	model.latestVersion = latestVersion
+	model.worktree, _ = git.FindGitRoot(".")
 	if service, closeFn, err := branchsync.OpenCurrent(); err == nil {
 		defer closeFn()
 		model.syncService = service

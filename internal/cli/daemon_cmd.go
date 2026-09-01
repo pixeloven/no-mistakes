@@ -106,6 +106,10 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			worktree, err := parseWorktreePushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
 			gatePath, err := normalizeNotifyGatePath(gate)
 			if err != nil {
 				return err
@@ -128,6 +132,7 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 				Ref:       ref,
 				Old:       oldSHA,
 				New:       newSHA,
+				Worktree:  worktree,
 				SkipSteps: skipSteps,
 				Intent:    intent,
 			}, &result)
@@ -193,6 +198,7 @@ func parseSkipSteps(value string) ([]types.StepName, error) {
 // The value is base64-encoded so multi-line or special-character intents
 // survive the push-option transport (which is line-oriented).
 const intentPushOptionPrefix = "no-mistakes.intent="
+const worktreePushOptionPrefix = "no-mistakes.worktree="
 
 // formatIntentPushOption encodes intent as a single push option, or returns ""
 // when there is no intent to carry.
@@ -219,6 +225,29 @@ func parseIntentPushOptions(options []string) (string, error) {
 		intent = string(decoded)
 	}
 	return intent, nil
+}
+
+func formatWorktreePushOption(worktree string) string {
+	if strings.TrimSpace(worktree) == "" {
+		return ""
+	}
+	return worktreePushOptionPrefix + base64.StdEncoding.EncodeToString([]byte(worktree))
+}
+
+func parseWorktreePushOptions(options []string) (string, error) {
+	worktree := ""
+	for _, option := range options {
+		encoded, ok := strings.CutPrefix(option, worktreePushOptionPrefix)
+		if !ok {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return "", fmt.Errorf("decode worktree push option: %w", err)
+		}
+		worktree = string(decoded)
+	}
+	return worktree, nil
 }
 
 func formatSkipPushOptions(steps []types.StepName) []string {
