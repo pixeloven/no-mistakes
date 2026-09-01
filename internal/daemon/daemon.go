@@ -400,14 +400,6 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 		logStartupPhase("terminal_pr_runs", terminalPRStarted, "reconciled", terminalPRCount)
 	}
 
-	parkedStarted := time.Now()
-	plans := mgr.recoverableParkedRuns(context.Background())
-	preserved := make(map[string]struct{}, len(plans))
-	for _, plan := range plans {
-		preserved[plan.run.ID] = struct{}{}
-	}
-	logStartupPhase("parked_runs", parkedStarted, "preserved", len(plans))
-
 	gateStarted := time.Now()
 	gateStats := migrateGateConfigs(context.Background(), d, p)
 	logStartupPhase("gate_migration", gateStarted,
@@ -417,6 +409,14 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 		"rejected", gateStats.Rejected,
 		"failed", gateStats.Failed,
 	)
+
+	parkedStarted := time.Now()
+	plans := mgr.recoverableParkedRuns(context.Background())
+	preserved := make(map[string]struct{}, len(plans))
+	for _, plan := range plans {
+		preserved[plan.run.ID] = struct{}{}
+	}
+	logStartupPhase("parked_runs", parkedStarted, "preserved", len(plans))
 
 	// Read while the runs that were executing when this daemon started still say
 	// so: recovery below turns them terminal, and they are the ones whose

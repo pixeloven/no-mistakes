@@ -105,43 +105,51 @@ func TestRunAndAgentEnvironmentPreserveCapturedSigningPolicy(t *testing.T) {
 	}
 
 	ctx := WithEnvironment(context.Background(), runenv.Overlay{Set: map[string]string{
-		"GIT_CONFIG_COUNT":   "1",
+		"GIT_CONFIG_COUNT":   "3",
 		"GIT_CONFIG_KEY_0":   "commit.gpgsign",
 		"GIT_CONFIG_VALUE_0": "true",
+		"GIT_CONFIG_KEY_1":   "user.name",
+		"GIT_CONFIG_VALUE_1": "Ambient Name",
+		"GIT_CONFIG_KEY_2":   "user.email",
+		"GIT_CONFIG_VALUE_2": "ambient@example.com",
 	}})
-	policy, err := RunWithCommitSigningPolicy(ctx, dst, "config", "--bool", "commit.gpgsign")
+	policy, err := RunWithLocalCommitPolicy(ctx, dst, "config", "--bool", "commit.gpgsign")
 	if err != nil || policy != "false" {
 		t.Fatalf("command signing policy = %q, %v", policy, err)
 	}
-
-	env, err := CommitSigningPolicyEnvironment(context.Background(), dst, []string{
-		"GIT_CONFIG_COUNT=1",
-		"GIT_CONFIG_KEY_0=safe.bareRepository",
-		"GIT_CONFIG_VALUE_0=explicit",
-	})
-	if err != nil {
-		t.Fatalf("CommitSigningPolicyEnvironment: %v", err)
+	name, err := RunWithLocalCommitPolicy(ctx, dst, "config", "--get", "user.name")
+	if err != nil || name != "Test" {
+		t.Fatalf("command identity = %q, %v", name, err)
 	}
-	policy, err = RunWithEnv(context.Background(), dst, env, "config", "--bool", "commit.gpgsign")
-	if err != nil || policy != "false" {
-		t.Fatalf("agent signing policy = %q, %v", policy, err)
-	}
-	barePolicy, err := RunWithEnv(context.Background(), dst, env, "config", "--get", "safe.bareRepository")
-	if err != nil || barePolicy != "explicit" {
-		t.Fatalf("preserved ambient config = %q, %v", barePolicy, err)
+	email, err := RunWithLocalCommitPolicy(ctx, dst, "config", "--get", "user.email")
+	if err != nil || email != "test@test.com" {
+		t.Fatalf("command email = %q, %v", email, err)
 	}
 
-	overlay, err := CommitSigningPolicyOverlay(context.Background(), dst, runenv.Overlay{Set: map[string]string{
+	overlay, err := CommitPolicyOverlay(context.Background(), dst, runenv.Overlay{Set: map[string]string{
 		"GIT_CONFIG_COUNT":   "1",
 		"GIT_CONFIG_KEY_0":   "safe.bareRepository",
 		"GIT_CONFIG_VALUE_0": "explicit",
 	}})
 	if err != nil {
-		t.Fatalf("CommitSigningPolicyOverlay: %v", err)
+		t.Fatalf("CommitPolicyOverlay: %v", err)
 	}
-	policy, err = RunWithEnv(context.Background(), dst, overlay.Apply(nil), "config", "--bool", "commit.gpgsign")
+	env := overlay.Apply(nil)
+	policy, err = RunWithEnv(context.Background(), dst, env, "config", "--bool", "commit.gpgsign")
 	if err != nil || policy != "false" {
 		t.Fatalf("persistent agent signing policy = %q, %v", policy, err)
+	}
+	name, err = RunWithEnv(context.Background(), dst, env, "config", "--get", "user.name")
+	if err != nil || name != "Test" {
+		t.Fatalf("agent identity = %q, %v", name, err)
+	}
+	email, err = RunWithEnv(context.Background(), dst, env, "config", "--get", "user.email")
+	if err != nil || email != "test@test.com" {
+		t.Fatalf("agent email = %q, %v", email, err)
+	}
+	barePolicy, err := RunWithEnv(context.Background(), dst, env, "config", "--get", "safe.bareRepository")
+	if err != nil || barePolicy != "explicit" {
+		t.Fatalf("preserved ambient config = %q, %v", barePolicy, err)
 	}
 }
 
@@ -220,13 +228,13 @@ func TestCopyLocalCommitSettings(t *testing.T) {
 		t.Fatalf("CopyLocalCommitSettings failed: %v", err)
 	}
 
-	if got := run(t, dst, "git", "config", "--local", "--get", "user.name"); got != "Test" {
+	if got := run(t, dst, "git", "config", "--worktree", "--get", "user.name"); got != "Test" {
 		t.Fatalf("user.name = %q, want %q", got, "Test")
 	}
-	if got := run(t, dst, "git", "config", "--local", "--get", "user.email"); got != "test@test.com" {
+	if got := run(t, dst, "git", "config", "--worktree", "--get", "user.email"); got != "test@test.com" {
 		t.Fatalf("user.email = %q, want %q", got, "test@test.com")
 	}
-	if got := run(t, dst, "git", "config", "--local", "--get", "commit.gpgsign"); got != "false" {
+	if got := run(t, dst, "git", "config", "--worktree", "--get", "commit.gpgsign"); got != "false" {
 		t.Fatalf("commit.gpgsign = %q, want false", got)
 	}
 }
@@ -258,7 +266,7 @@ func TestCopyLocalCommitSettings_ExplicitUnsignedPolicySurvivesFailingSigner(t *
 	if err := CopyLocalCommitSettings(ctx, src, dst); err != nil {
 		t.Fatalf("CopyLocalCommitSettings failed: %v", err)
 	}
-	if _, err := Run(ctx, dst, "commit", "-m", "pipeline review fix"); err != nil {
+	if err := CommitWithLocalCommitPolicy(ctx, dst, "pipeline review fix", ""); err != nil {
 		t.Fatalf("explicitly unsigned pipeline commit failed: %v", err)
 	}
 	commit := run(t, dst, "git", "cat-file", "commit", "HEAD")
@@ -270,10 +278,13 @@ func TestCopyLocalCommitSettings_ExplicitUnsignedPolicySurvivesFailingSigner(t *
 	}
 }
 
-func TestCopyLocalCommitSettings_FallbackSnapshotsConcurrentSigningPolicies(t *testing.T) {
+func TestCopyLocalCommitSettings_IsolatesConcurrentSigningPolicies(t *testing.T) {
 	ctx := context.Background()
 	src := initTestRepo(t)
 	dst := initTestRepo(t)
+	run(t, dst, "git", "config", "extensions.worktreeConfig", "true")
+	run(t, dst, "git", "config", "--worktree", "core.bare", "false")
+	run(t, dst, "git", "config", "--local", "--unset-all", "core.bare")
 	linkedA := filepath.Join(t.TempDir(), "linked-a")
 	linkedB := filepath.Join(t.TempDir(), "linked-b")
 	run(t, dst, "git", "worktree", "add", "--detach", linkedA, "HEAD")
@@ -302,15 +313,30 @@ func TestCopyLocalCommitSettings_FallbackSnapshotsConcurrentSigningPolicies(t *t
 		"GIT_CONFIG_KEY_2=user.signingkey",
 		"GIT_CONFIG_VALUE_2=test-signing-key",
 	}
-	if err := CommitWithLocalSigningPolicyFromEnv(ctx, linkedA, env, "pipeline review fix A", ""); err != nil {
+	if err := CommitWithLocalCommitPolicyFromEnv(ctx, linkedA, env, "pipeline review fix A", ""); err != nil {
 		t.Fatalf("run A correction did not retain unsigned policy: %v", err)
 	}
 	beforeB := run(t, linkedB, "git", "rev-parse", "HEAD")
-	if err := CommitWithLocalSigningPolicyFromEnv(ctx, linkedB, env, "pipeline review fix B", ""); err == nil {
+	if err := CommitWithLocalCommitPolicyFromEnv(ctx, linkedB, env, "pipeline review fix B", ""); err == nil {
 		t.Fatal("run B correction did not retain normal signing precedence")
 	}
 	if got := run(t, linkedB, "git", "rev-parse", "HEAD"); got != beforeB {
 		t.Fatalf("failed signed commit moved run B HEAD to %s, want %s", got, beforeB)
+	}
+}
+
+func TestCopyLocalCommitSettings_RejectsSharedConfigFallback(t *testing.T) {
+	ctx := context.Background()
+	src := initTestRepo(t)
+	dst := initTestRepo(t)
+	linkedA := filepath.Join(t.TempDir(), "linked-a")
+	linkedB := filepath.Join(t.TempDir(), "linked-b")
+	run(t, dst, "git", "worktree", "add", "--detach", linkedA, "HEAD")
+	run(t, dst, "git", "worktree", "add", "--detach", linkedB, "HEAD")
+
+	err := CopyLocalCommitSettings(ctx, src, linkedA)
+	if err == nil || !strings.Contains(err.Error(), "upgrade Git") || !strings.Contains(err.Error(), "worktree configuration") {
+		t.Fatalf("unsupported worktree config error = %v", err)
 	}
 }
 
@@ -330,7 +356,7 @@ func TestCopyLocalCommitSettings_PrefersWorktreeSigningPolicy(t *testing.T) {
 	run(t, dst, "git", "config", "gpg.program", filepath.Join(t.TempDir(), "missing-signer"))
 	run(t, dst, "git", "config", "user.signingkey", "test-signing-key")
 	before := run(t, dst, "git", "rev-parse", "HEAD")
-	if err := CommitWithLocalSigningPolicy(ctx, dst, "pipeline review fix", ""); err == nil {
+	if err := CommitWithLocalCommitPolicy(ctx, dst, "pipeline review fix", ""); err == nil {
 		t.Fatal("correction commit ignored worktree signing policy")
 	}
 	if got := run(t, dst, "git", "rev-parse", "HEAD"); got != before {
@@ -363,7 +389,7 @@ func TestCopyLocalCommitSettings_PreservesSignedAndDefaultBehavior(t *testing.T)
 			if err := CopyLocalCommitSettings(ctx, src, dst); err != nil {
 				t.Fatalf("CopyLocalCommitSettings failed: %v", err)
 			}
-			if got := run(t, dst, "git", "config", "--local", "--get", "commit.gpgsign"); got != tt.wantPolicy {
+			if got := run(t, dst, "git", "config", "--get", "commit.gpgsign"); got != tt.wantPolicy {
 				t.Fatalf("commit.gpgsign = %q, want %q", got, tt.wantPolicy)
 			}
 			writeFile(t, filepath.Join(dst, "generated-fix.txt"), "generated review fix\n")

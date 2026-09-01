@@ -586,64 +586,60 @@ func CommitAll(ctx context.Context, dir, message string) error {
 	return err
 }
 
-// LocalCommitSigningPolicy returns the run-captured commit signing policy,
-// falling back to worktree-local configuration for legacy callers.
-func LocalCommitSigningPolicy(ctx context.Context, dir string) (string, error) {
-	return localCommitSigningPolicyFromEnv(ctx, dir, nil)
-}
-
-func localCommitSigningPolicyFromEnv(ctx context.Context, dir string, env []string) (string, error) {
-	if policy, ok, err := CommitSigningPolicySnapshot(ctx, dir); err != nil || ok {
-		return policy, err
-	}
-	policy, err := RunWithEnv(ctx, dir, env, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
-	if err == nil || !WorktreeConfigUnavailable(err) {
-		return policy, err
-	}
-	return RunWithEnv(ctx, dir, env, "config", "--local", "--get", "--default", "", "commit.gpgsign")
-}
-
-func RunWithCommitSigningPolicy(ctx context.Context, dir string, args ...string) (string, error) {
-	policy, err := localCommitSigningPolicyFromEnv(ctx, dir, nil)
+func RunWithLocalCommitPolicy(ctx context.Context, dir string, args ...string) (string, error) {
+	policyArgs, err := LocalCommitPolicyArgs(ctx, dir)
 	if err != nil {
 		return "", err
 	}
-	if policy != "" {
-		args = append([]string{"-c", "commit.gpgsign=" + policy}, args...)
-	}
+	args = append(policyArgs, args...)
 	return Run(ctx, dir, args...)
 }
 
-func CommitSigningPolicyEnvironment(ctx context.Context, dir string, env []string) ([]string, error) {
-	policy, err := localCommitSigningPolicyFromEnv(ctx, dir, env)
+type commitConfigEntry struct {
+	key   string
+	value string
+}
+
+func localCommitPolicyEntries(ctx context.Context, dir string, env []string) ([]commitConfigEntry, error) {
+	if err := RequireWorktreeCommitSettings(ctx, dir); err != nil {
+		return nil, err
+	}
+	entries := make([]commitConfigEntry, 0, 3)
+	for _, key := range []string{"user.name", "user.email"} {
+		value, err := RunWithEnv(ctx, dir, env, "config", "--worktree", "--get", "--default", "", key)
+		if err != nil {
+			return nil, err
+		}
+		if value != "" {
+			entries = append(entries, commitConfigEntry{key: key, value: value})
+		}
+	}
+	policy, ok, err := CommitSigningPolicySnapshot(ctx, dir)
 	if err != nil {
 		return nil, err
 	}
-	if policy == "" {
-		return env, nil
-	}
-
-	count := 0
-	if value, ok := environmentValue(env, "GIT_CONFIG_COUNT"); ok {
-		count, err = strconv.Atoi(value)
-		if err != nil || count < 0 {
-			return nil, fmt.Errorf("invalid GIT_CONFIG_COUNT %q", value)
+	if !ok {
+		policy, err = RunWithEnv(ctx, dir, env, "config", "--worktree", "--bool", "--get", "--default", "", "commit.gpgsign")
+		if err != nil {
+			return nil, err
 		}
 	}
-	out := append([]string(nil), env...)
-	out = append(out,
-		fmt.Sprintf("GIT_CONFIG_COUNT=%d", count+1),
-		fmt.Sprintf("GIT_CONFIG_KEY_%d=commit.gpgsign", count),
-		fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", count, policy),
-	)
-	return out, nil
+	if policy != "" {
+		entries = append(entries, commitConfigEntry{key: "commit.gpgsign", value: policy})
+	}
+	return entries, nil
 }
 
-func environmentValue(env []string, key string) (string, bool) {
-	if value, ok := environmentSliceValue(env, key); ok {
-		return value, true
+func LocalCommitPolicyArgs(ctx context.Context, dir string) ([]string, error) {
+	entries, err := localCommitPolicyEntries(ctx, dir, nil)
+	if err != nil {
+		return nil, err
 	}
-	return os.LookupEnv(key)
+	args := make([]string, 0, len(entries)*2)
+	for _, entry := range entries {
+		args = append(args, "-c", entry.key+"="+entry.value)
+	}
+	return args, nil
 }
 
 func environmentSliceValue(env []string, key string) (string, bool) {
@@ -656,27 +652,23 @@ func environmentSliceValue(env []string, key string) (string, bool) {
 	return "", false
 }
 
-// CommitWithLocalSigningPolicy creates a commit while preserving the invoking
-// repository's explicit local signing decision. Passing the value as a
-// command-local override is important for pipeline worktrees: ambient
-// GIT_CONFIG_* settings (including a maintainer's signer) must not override an
-// explicit local false, while repositories with no local policy retain normal
-// Git precedence. hookPath, when non-empty, isolates hooks for machine-owned
+// CommitWithLocalCommitPolicy creates a commit with the run-captured identity
+// and signing policy. hookPath, when non-empty, isolates hooks for machine-owned
 // correction commits.
-func CommitWithLocalSigningPolicy(ctx context.Context, dir, message, hookPath string) error {
-	return CommitWithLocalSigningPolicyFromEnv(ctx, dir, nil, message, hookPath)
+func CommitWithLocalCommitPolicy(ctx context.Context, dir, message, hookPath string) error {
+	return CommitWithLocalCommitPolicyFromEnv(ctx, dir, nil, message, hookPath)
 }
 
-// CommitWithLocalSigningPolicyFromEnv is CommitWithLocalSigningPolicy with an
+// CommitWithLocalCommitPolicyFromEnv is CommitWithLocalCommitPolicy with an
 // explicit subprocess environment (used by step-scoped PATH/credentials).
-func CommitWithLocalSigningPolicyFromEnv(ctx context.Context, dir string, env []string, message, hookPath string) error {
-	policyOut, err := localCommitSigningPolicyFromEnv(ctx, dir, env)
+func CommitWithLocalCommitPolicyFromEnv(ctx context.Context, dir string, env []string, message, hookPath string) error {
+	entries, err := localCommitPolicyEntries(ctx, dir, env)
 	if err != nil {
 		return err
 	}
 	args := make([]string, 0, 8)
-	if policyOut != "" {
-		args = append(args, "-c", "commit.gpgsign="+policyOut)
+	for _, entry := range entries {
+		args = append(args, "-c", entry.key+"="+entry.value)
 	}
 	if hookPath != "" {
 		args = append(args, "-c", "core.hooksPath="+hookPath)
@@ -693,18 +685,16 @@ func CommitWithLocalSigningPolicyFromEnv(ctx context.Context, dir string, env []
 // CopyLocalCommitSettings copies repository-local identity from srcDir into
 // dstDir and captures the run's commit signing policy.
 //
-// The write into dstDir uses per-worktree scope (`git config --worktree`) when
-// the repository has worktree config enabled. dstDir is typically a linked
-// worktree of the shared gate bare repo, where an unscoped `git config --local`
+// The write into dstDir uses per-worktree scope (`git config --worktree`).
+// dstDir is typically a linked worktree of the shared gate bare repo, where an
+// unscoped `git config --local`
 // write lands in the bare's shared config and takes <bare>/config.lock. Two
 // runs starting concurrently on different branches of the same repo then race
 // on that single lock and one fails with "could not lock config file ...
 // config: File exists". Writing per-worktree puts each run's identity in its own
 // <bare>/worktrees/<id>/config.worktree, so concurrent startups never contend.
-// Older Git without `--worktree` support falls back to `--local`.
 func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
-	scope, err := localCommitSettingsScope(ctx, dstDir)
-	if err != nil {
+	if err := RequireWorktreeCommitSettings(ctx, dstDir); err != nil {
 		return err
 	}
 	for _, key := range []string{"user.name", "user.email"} {
@@ -715,7 +705,7 @@ func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
 		if value == "" {
 			continue
 		}
-		if _, err := Run(ctx, dstDir, "config", scope, key, value); err != nil {
+		if _, err := Run(ctx, dstDir, "config", "--worktree", key, value); err != nil {
 			return err
 		}
 	}
@@ -723,8 +713,8 @@ func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
 	if err != nil {
 		return err
 	}
-	if scope == "--worktree" && policy != "" {
-		if _, err := Run(ctx, dstDir, "config", scope, "commit.gpgsign", policy); err != nil {
+	if policy != "" {
+		if _, err := Run(ctx, dstDir, "config", "--worktree", "commit.gpgsign", policy); err != nil {
 			return err
 		}
 	}
@@ -773,17 +763,6 @@ func CommitSigningPolicySnapshot(ctx context.Context, dir string) (policy string
 	return policy, true, nil
 }
 
-func CaptureLegacyCommitSigningPolicySnapshot(ctx context.Context, dir string) error {
-	if _, ok, err := CommitSigningPolicySnapshot(ctx, dir); err != nil || ok {
-		return err
-	}
-	policy, err := explicitRepositoryCommitSigningPolicy(ctx, dir)
-	if err != nil {
-		return err
-	}
-	return writeCommitSigningPolicySnapshot(ctx, dir, policy)
-}
-
 func writeCommitSigningPolicySnapshot(ctx context.Context, dir, policy string) error {
 	path, err := commitSigningPolicyPath(ctx, dir)
 	if err != nil {
@@ -809,15 +788,15 @@ func commitSigningPolicyPath(ctx context.Context, dir string) (string, error) {
 	return filepath.Clean(path), nil
 }
 
-func localCommitSettingsScope(ctx context.Context, dir string) (string, error) {
+func RequireWorktreeCommitSettings(ctx context.Context, dir string) error {
 	_, err := Run(ctx, dir, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
 	if err == nil {
-		return "--worktree", nil
+		return nil
 	}
 	if WorktreeConfigUnavailable(err) {
-		return "--local", nil
+		return fmt.Errorf("concurrent autonomous runs require Git worktree configuration; upgrade Git to a version supporting git config --worktree and reinitialize the gate: %w", err)
 	}
-	return "", err
+	return err
 }
 
 // WorktreeConfigUnavailable reports whether `git config --worktree` cannot be
@@ -825,8 +804,7 @@ func localCommitSettingsScope(ctx context.Context, dir string) (string, error) {
 // the installed Git is too old for the flag (isWorktreeConfigUnsupported), or
 // the repo has more than one worktree without extensions.worktreeConfig enabled
 // ("--worktree cannot be used with multiple working trees unless the config
-// extension worktreeConfig is enabled"). Both mean the caller should fall back
-// to the shared --local config.
+// extension worktreeConfig is enabled").
 func WorktreeConfigUnavailable(err error) bool {
 	if isWorktreeConfigUnsupported(err) {
 		return true

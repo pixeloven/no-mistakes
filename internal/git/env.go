@@ -22,13 +22,13 @@ func WithEnvironment(ctx context.Context, overlay runenv.Overlay) context.Contex
 	return context.WithValue(ctx, environmentContextKey{}, overlay.Clone())
 }
 
-func CommitSigningPolicyOverlay(ctx context.Context, dir string, overlay runenv.Overlay) (runenv.Overlay, error) {
-	policy, ok, err := CommitSigningPolicySnapshot(ctx, dir)
+func CommitPolicyOverlay(ctx context.Context, dir string, overlay runenv.Overlay) (runenv.Overlay, error) {
+	entries, err := localCommitPolicyEntries(ctx, dir, overlay.Apply(nil))
 	if err != nil {
 		return runenv.Overlay{}, err
 	}
 	out := overlay.Clone()
-	if !ok || policy == "" {
+	if len(entries) == 0 {
 		return out, nil
 	}
 
@@ -42,9 +42,12 @@ func CommitSigningPolicyOverlay(ctx context.Context, dir string, overlay runenv.
 	if out.Set == nil {
 		out.Set = make(map[string]string)
 	}
-	out.Set["GIT_CONFIG_COUNT"] = strconv.Itoa(count + 1)
-	out.Set[fmt.Sprintf("GIT_CONFIG_KEY_%d", count)] = "commit.gpgsign"
-	out.Set[fmt.Sprintf("GIT_CONFIG_VALUE_%d", count)] = policy
+	out.Set["GIT_CONFIG_COUNT"] = strconv.Itoa(count + len(entries))
+	for i, entry := range entries {
+		index := count + i
+		out.Set[fmt.Sprintf("GIT_CONFIG_KEY_%d", index)] = entry.key
+		out.Set[fmt.Sprintf("GIT_CONFIG_VALUE_%d", index)] = entry.value
+	}
 	return out, nil
 }
 

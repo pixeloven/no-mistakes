@@ -308,8 +308,8 @@ func MarkGateConfigCurrent(bareDir string) error {
 }
 
 func gateConfigStampContent() string {
-	sum := sha256.Sum256([]byte("gate-config-v3\x00" + PreReceiveHookScript() + "\x00" + PostReceiveHookScript()))
-	return fmt.Sprintf("v3:%x\n", sum)
+	sum := sha256.Sum256([]byte("gate-config-v2\x00" + PreReceiveHookScript() + "\x00" + PostReceiveHookScript()))
+	return fmt.Sprintf("v2:%x\n", sum)
 }
 
 // IsolateHooksPath protects the gate's post-receive hook from being
@@ -344,9 +344,6 @@ func IsolateHooksPath(ctx context.Context, bareDir string) error {
 }
 
 func EnsureHooksPathIsolation(ctx context.Context, bareDir string) (bool, error) {
-	if err := clearLegacyCommitSigningPolicy(ctx, bareDir); err != nil {
-		return false, fmt.Errorf("clear legacy commit signing policy: %w", err)
-	}
 	if _, err := runGit(ctx, bareDir, "config", "--worktree", "--get", "core.hookspath"); err != nil {
 		if isWorktreeConfigUnsupported(err) {
 			return false, nil
@@ -369,14 +366,6 @@ func EnsureHooksPathIsolation(ctx context.Context, bareDir string) (bool, error)
 		return false, err
 	}
 	return true, nil
-}
-
-func clearLegacyCommitSigningPolicy(ctx context.Context, bareDir string) error {
-	_, err := runGit(ctx, bareDir, "config", "--local", "--unset-all", "commit.gpgsign")
-	if err != nil && !isConfigKeyMissing(err) {
-		return err
-	}
-	return nil
 }
 
 // relocateCoreBareToWorktreeScope moves core.bare out of shared local config

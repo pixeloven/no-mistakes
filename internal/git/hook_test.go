@@ -792,7 +792,7 @@ func TestIsolateHooksPath_Idempotent(t *testing.T) {
 	}
 }
 
-func TestEnsureHooksPathIsolationClearsLegacySharedSigningPolicy(t *testing.T) {
+func TestEnsureHooksPathIsolationPreservesSharedSigningPolicy(t *testing.T) {
 	ctx := context.Background()
 	bare := filepath.Join(t.TempDir(), "test.git")
 	if err := InitBare(ctx, bare); err != nil {
@@ -808,8 +808,8 @@ func TestEnsureHooksPathIsolationClearsLegacySharedSigningPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if policy != "" {
-		t.Fatalf("shared commit.gpgsign = %q, want unset", policy)
+	if policy != "false" {
+		t.Fatalf("shared commit.gpgsign = %q, want false", policy)
 	}
 }
 

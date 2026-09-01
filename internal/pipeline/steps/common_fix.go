@@ -155,13 +155,9 @@ func commitPipelineCorrection(ctx context.Context, workDir, message string, logf
 }
 
 func commitStepCorrection(sctx *pipeline.StepContext, message string, hookFree bool) error {
-	policy, err := stepCommitSigningPolicy(sctx)
+	args, err := git.LocalCommitPolicyArgs(sctx.Ctx, sctx.WorkDir)
 	if err != nil {
 		return err
-	}
-	args := make([]string, 0, 8)
-	if policy != "" {
-		args = append(args, "-c", "commit.gpgsign="+policy)
 	}
 	if !hookFree {
 		args = append(args, "commit", "-m", message)
@@ -178,17 +174,6 @@ func commitStepCorrection(sctx *pipeline.StepContext, message string, hookFree b
 	return err
 }
 
-func stepCommitSigningPolicy(sctx *pipeline.StepContext) (string, error) {
-	if policy, ok, err := git.CommitSigningPolicySnapshot(sctx.Ctx, sctx.WorkDir); err != nil || ok {
-		return policy, err
-	}
-	policy, err := stepGitRun(sctx, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
-	if err == nil || !git.WorktreeConfigUnavailable(err) {
-		return policy, err
-	}
-	return stepGitRun(sctx, "config", "--local", "--get", "--default", "", "commit.gpgsign")
-}
-
 func commitPipelineCorrectionWithCleanup(
 	ctx context.Context,
 	workDir, message string,
@@ -199,7 +184,7 @@ func commitPipelineCorrectionWithCleanup(
 	if err != nil {
 		return fmt.Errorf("prepare hook-free commit environment: %w", err)
 	}
-	commitErr := git.CommitWithLocalSigningPolicy(ctx, workDir, message, emptyHooksDir)
+	commitErr := git.CommitWithLocalCommitPolicy(ctx, workDir, message, emptyHooksDir)
 	if cleanupErr := cleanup(emptyHooksDir); cleanupErr != nil {
 		if logf != nil {
 			logf(fmt.Sprintf("warning: failed to remove temporary hook-free commit directory %s: %v", emptyHooksDir, cleanupErr))

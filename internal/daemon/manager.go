@@ -159,8 +159,8 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if !samePath(resolveGitPath(workDir, commonDir), gateDir) {
 		return nil, fmt.Errorf("worktree does not belong to its gate repository")
 	}
-	if err := git.CaptureLegacyCommitSigningPolicySnapshot(ctx, workDir); err != nil {
-		return nil, fmt.Errorf("capture legacy commit signing policy: %w", err)
+	if err := git.RequireWorktreeCommitSettings(ctx, workDir); err != nil {
+		return nil, err
 	}
 
 	execSteps := m.steps()
@@ -175,9 +175,9 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if err != nil {
 		return nil, fmt.Errorf("resolve forge profile: %w", err)
 	}
-	agentEnvironment, err := git.CommitSigningPolicyOverlay(ctx, workDir, forgeEnvironment(forgeCtx))
+	agentEnvironment, err := git.CommitPolicyOverlay(ctx, workDir, forgeEnvironment(forgeCtx))
 	if err != nil {
-		return nil, fmt.Errorf("configure agent commit signing policy: %w", err)
+		return nil, fmt.Errorf("configure agent commit policy: %w", err)
 	}
 	ag, err := newPipelineAgent(ctx, cfg, m.paths.EvidenceRoot(cfg.Test.Evidence.LocalRoot), exec.LookPath, agentEnvironment)
 	if err != nil {
@@ -1053,11 +1053,11 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		trackStartFailure("resolve_forge_profile")
 		return "", fmt.Errorf("resolve forge profile: %w", err)
 	}
-	agentEnvironment, err := git.CommitSigningPolicyOverlay(ctx, wtDir, forgeEnvironment(forgeCtx))
+	agentEnvironment, err := git.CommitPolicyOverlay(ctx, wtDir, forgeEnvironment(forgeCtx))
 	if err != nil {
-		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure agent commit signing policy: %s", err))
-		trackStartFailure("configure_agent_signing_policy")
-		return "", fmt.Errorf("configure agent commit signing policy: %w", err)
+		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure agent commit policy: %s", err))
+		trackStartFailure("configure_agent_commit_policy")
+		return "", fmt.Errorf("configure agent commit policy: %w", err)
 	}
 
 	// Create agent. In demo mode, skip resolution and use a no-op agent.
