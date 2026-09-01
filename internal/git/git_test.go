@@ -425,6 +425,7 @@ func TestCopyLocalCommitSettings_RejectsLegacySharedCommitSettings(t *testing.T)
 	}{
 		{key: "commit.gpgsign", value: "false"},
 		{key: "user.name", value: "Legacy Name"},
+		{key: "user.name", value: "no-mistakes:config-key-absent"},
 		{key: "user.email", value: "legacy@example.com"},
 	} {
 		t.Run(setting.key, func(t *testing.T) {

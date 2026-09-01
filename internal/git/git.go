@@ -818,13 +818,13 @@ func RequireWorktreeCommitSettings(ctx context.Context, dir string) error {
 		return err
 	}
 	for _, key := range []string{"commit.gpgsign", "user.name", "user.email"} {
-		const absent = "no-mistakes:config-key-absent"
-		value, err := Run(ctx, dir, "config", "--local", "--get", "--default", absent, key)
-		if err != nil {
-			return err
-		}
-		if value != absent {
+		_, err := Run(ctx, dir, "config", "--local", "--get", key)
+		if err == nil {
 			return fmt.Errorf("concurrent autonomous runs require isolated worktree commit settings; shared gate config contains %s; reinitialize the gate before retrying", key)
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			return err
 		}
 	}
 	return nil
