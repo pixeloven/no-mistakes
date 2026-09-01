@@ -603,6 +603,52 @@ func localCommitSigningPolicyFromEnv(ctx context.Context, dir string, env []stri
 	return RunWithEnv(ctx, dir, env, "config", "--local", "--get", "--default", "", "commit.gpgsign")
 }
 
+func RunWithCommitSigningPolicy(ctx context.Context, dir string, args ...string) (string, error) {
+	policy, err := localCommitSigningPolicyFromEnv(ctx, dir, nil)
+	if err != nil {
+		return "", err
+	}
+	if policy != "" {
+		args = append([]string{"-c", "commit.gpgsign=" + policy}, args...)
+	}
+	return Run(ctx, dir, args...)
+}
+
+func CommitSigningPolicyEnvironment(ctx context.Context, dir string, env []string) ([]string, error) {
+	policy, err := localCommitSigningPolicyFromEnv(ctx, dir, env)
+	if err != nil {
+		return nil, err
+	}
+	if policy == "" {
+		return env, nil
+	}
+
+	count := 0
+	if value, ok := environmentValue(env, "GIT_CONFIG_COUNT"); ok {
+		count, err = strconv.Atoi(value)
+		if err != nil || count < 0 {
+			return nil, fmt.Errorf("invalid GIT_CONFIG_COUNT %q", value)
+		}
+	}
+	out := append([]string(nil), env...)
+	out = append(out,
+		fmt.Sprintf("GIT_CONFIG_COUNT=%d", count+1),
+		fmt.Sprintf("GIT_CONFIG_KEY_%d=commit.gpgsign", count),
+		fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", count, policy),
+	)
+	return out, nil
+}
+
+func environmentValue(env []string, key string) (string, bool) {
+	for i := len(env) - 1; i >= 0; i-- {
+		name, value, ok := strings.Cut(env[i], "=")
+		if ok && name == key {
+			return value, true
+		}
+	}
+	return os.LookupEnv(key)
+}
+
 // CommitWithLocalSigningPolicy creates a commit while preserving the invoking
 // repository's explicit local signing decision. Passing the value as a
 // command-local override is important for pipeline worktrees: ambient

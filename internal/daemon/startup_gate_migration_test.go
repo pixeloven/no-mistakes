@@ -174,3 +174,49 @@ func TestMigrateGateConfigsDoesNotStampUnsupportedIsolation(t *testing.T) {
 		t.Fatalf("second migration stats = %+v, want migration retry", second)
 	}
 }
+
+func TestMigrateGateConfigsDefersGateOwnedByLegacyParkedRun(t *testing.T) {
+	p := paths.WithRoot(filepath.Join(t.TempDir(), "nm-home"))
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	ctx := context.Background()
+	id := "parked"
+	gateDir := p.RepoDir(id)
+	if err := git.InitBare(ctx, gateDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.InsertRepoWithID(id, t.TempDir(), "https://example.com/parked.git", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git.RunBare(ctx, gateDir, "config", "commit.gpgsign", "false"); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := migrateGateConfigsExcept(ctx, database, p, map[string]struct{}{filepath.Clean(gateDir): {}})
+	if stats.Gates != 1 || stats.Deferred != 1 || stats.Migrated != 0 || stats.Failed != 0 {
+		t.Fatalf("deferred migration stats = %+v", stats)
+	}
+	policy, err := git.RunBare(ctx, gateDir, "config", "--local", "--get", "commit.gpgsign")
+	if err != nil || policy != "false" {
+		t.Fatalf("legacy signing policy after deferral = %q, %v", policy, err)
+	}
+	if git.GateConfigCurrent(gateDir) {
+		t.Fatal("deferred gate was stamped current")
+	}
+
+	stats = migrateGateConfigs(ctx, database, p)
+	if stats.Gates != 1 || stats.Migrated != 1 || stats.Deferred != 0 || stats.Failed != 0 {
+		t.Fatalf("resumed migration stats = %+v", stats)
+	}
+	policy, err = git.RunBare(ctx, gateDir, "config", "--local", "--get", "--default", "", "commit.gpgsign")
+	if err != nil || policy != "" {
+		t.Fatalf("legacy signing policy after migration = %q, %v", policy, err)
+	}
+}

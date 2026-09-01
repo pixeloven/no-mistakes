@@ -388,12 +388,25 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 	reapOrphanedServers(p)
 	logStartupPhase("orphan_servers", orphanStarted)
 
+	parkedStarted := time.Now()
+	plans := mgr.recoverableParkedRuns(context.Background())
+	preserved := make(map[string]struct{}, len(plans))
+	protectedGates := make(map[string]struct{})
+	for _, plan := range plans {
+		preserved[plan.run.ID] = struct{}{}
+		if _, ok, err := git.CommitSigningPolicySnapshot(context.Background(), plan.workDir); err != nil || !ok {
+			protectedGates[filepath.Clean(plan.gateDir)] = struct{}{}
+		}
+	}
+	logStartupPhase("parked_runs", parkedStarted, "preserved", len(plans))
+
 	gateStarted := time.Now()
-	gateStats := migrateGateConfigs(context.Background(), d, p)
+	gateStats := migrateGateConfigsExcept(context.Background(), d, p, protectedGates)
 	logStartupPhase("gate_migration", gateStarted,
 		"gate_count", gateStats.Gates,
 		"current", gateStats.Current,
 		"migrated", gateStats.Migrated,
+		"deferred", gateStats.Deferred,
 		"rejected", gateStats.Rejected,
 		"failed", gateStats.Failed,
 	)
@@ -409,14 +422,6 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 		}
 		logStartupPhase("terminal_pr_runs", terminalPRStarted, "reconciled", terminalPRCount)
 	}
-
-	parkedStarted := time.Now()
-	plans := mgr.recoverableParkedRuns(context.Background())
-	preserved := make(map[string]struct{}, len(plans))
-	for _, plan := range plans {
-		preserved[plan.run.ID] = struct{}{}
-	}
-	logStartupPhase("parked_runs", parkedStarted, "preserved", len(plans))
 
 	// Read while the runs that were executing when this daemon started still say
 	// so: recovery below turns them terminal, and they are the ones whose
@@ -923,6 +928,7 @@ type gateMigrationStats struct {
 	Gates    int
 	Current  int
 	Migrated int
+	Deferred int
 	Rejected int
 	Failed   int
 }
@@ -937,6 +943,10 @@ var sweepRunWorktrees = procreap.SweepRunWorktrees
 // mutation. A completed, content-versioned stamp makes normal restarts a cheap
 // filesystem-only pass instead of six Git subprocesses per gate.
 func migrateGateConfigs(ctx context.Context, d *db.DB, p *paths.Paths) gateMigrationStats {
+	return migrateGateConfigsExcept(ctx, d, p, nil)
+}
+
+func migrateGateConfigsExcept(ctx context.Context, d *db.DB, p *paths.Paths, protected map[string]struct{}) gateMigrationStats {
 	var stats gateMigrationStats
 	candidates := make(map[string]struct{})
 	reposDir := filepath.Clean(p.ReposDir())
@@ -989,6 +999,11 @@ func migrateGateConfigs(ctx context.Context, d *db.DB, p *paths.Paths) gateMigra
 		if git.GateConfigCurrent(bareDir) {
 			stats.Gates++
 			stats.Current++
+			continue
+		}
+		if _, ok := protected[filepath.Clean(bareDir)]; ok {
+			stats.Gates++
+			stats.Deferred++
 			continue
 		}
 		if err := git.ValidateBareRepository(ctx, bareDir); err != nil {

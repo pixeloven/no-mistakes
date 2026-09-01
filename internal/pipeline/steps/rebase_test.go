@@ -13,6 +13,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	gitutil "github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 )
 
@@ -157,7 +158,6 @@ func TestRebaseStep_UsesConfiguredPRBaseBranch(t *testing.T) {
 }
 
 func TestRebaseStep_FixModeCallsAgent(t *testing.T) {
-	t.Parallel()
 	upstream := t.TempDir()
 	gitCmd(t, upstream, "init", "--bare")
 
@@ -185,6 +185,10 @@ func TestRebaseStep_FixModeCallsAgent(t *testing.T) {
 	gitCmd(t, dir, "commit", "-m", "main conflict")
 	gitCmd(t, dir, "push", "origin", "main")
 	gitCmd(t, dir, "checkout", "feature")
+	gitCmd(t, dir, "config", "--local", "commit.gpgsign", "false")
+	if err := gitutil.CopyLocalCommitSettings(context.Background(), dir, dir); err != nil {
+		t.Fatalf("capture signing policy: %v", err)
+	}
 
 	// Agent simulates resolving conflicts: resolve file, git add, git rebase --continue
 	ag := &mockAgent{
@@ -198,6 +202,7 @@ func TestRebaseStep_FixModeCallsAgent(t *testing.T) {
 				"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@test.com",
 				"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test.com",
 			)
+			cmd.Env = append(cmd.Env, opts.Env...)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return nil, fmt.Errorf("git add: %s: %w", out, err)
 			}
@@ -208,6 +213,7 @@ func TestRebaseStep_FixModeCallsAgent(t *testing.T) {
 				"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test.com",
 				"GIT_EDITOR=true",
 			)
+			cmd.Env = append(cmd.Env, opts.Env...)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return nil, fmt.Errorf("git rebase --continue: %s: %w", out, err)
 			}
@@ -234,6 +240,10 @@ func TestRebaseStep_FixModeCallsAgent(t *testing.T) {
 	}
 	if len(ag.calls) != 1 {
 		t.Fatalf("expected 1 agent call, got %d", len(ag.calls))
+	}
+	policy, err := gitutil.RunWithEnv(context.Background(), dir, ag.calls[0].Env, "config", "--bool", "commit.gpgsign")
+	if err != nil || policy != "false" {
+		t.Fatalf("agent rebase signing policy = %q, %v", policy, err)
 	}
 	if !strings.Contains(ag.calls[0].Prompt, "shared.txt") {
 		t.Error("expected agent prompt to mention conflicting file")

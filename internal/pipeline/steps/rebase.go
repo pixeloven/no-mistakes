@@ -347,7 +347,7 @@ func tryRebase(ctx context.Context, sctx *pipeline.StepContext, targetRef string
 	}
 
 	sctx.Log(fmt.Sprintf("rebasing onto %s...", targetRef))
-	if _, err := git.Run(ctx, sctx.WorkDir, "rebase", targetRef); err != nil {
+	if _, err := git.RunWithCommitSigningPolicy(ctx, sctx.WorkDir, "rebase", targetRef); err != nil {
 		conflictFiles := rebaseConflictFiles(ctx, sctx.WorkDir)
 		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")
 
@@ -370,7 +370,7 @@ func rebaseWithAgent(ctx context.Context, sctx *pipeline.StepContext, targetRef 
 	}
 
 	sctx.Log(fmt.Sprintf("rebasing onto %s...", targetRef))
-	if _, err := git.Run(ctx, sctx.WorkDir, "rebase", targetRef); err == nil {
+	if _, err := git.RunWithCommitSigningPolicy(ctx, sctx.WorkDir, "rebase", targetRef); err == nil {
 		return nil
 	}
 
@@ -406,9 +406,15 @@ Instructions:
 	prompt += executionContextPromptSection(sctx.WorkDir)
 	prompt = testguidance.LateRepairPrompt(string(types.StepRebase), prompt)
 
+	agentEnv, err := git.CommitSigningPolicyEnvironment(ctx, sctx.WorkDir, nil)
+	if err != nil {
+		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")
+		return fmt.Errorf("load rebase signing policy: %w", err)
+	}
 	_, err = sctx.RunAgentContext(ctx, agent.RunOpts{
 		Prompt:     prompt,
 		CWD:        sctx.WorkDir,
+		Env:        agentEnv,
 		JSONSchema: commitSummarySchema,
 		OnChunk:    sctx.LogChunk,
 	})

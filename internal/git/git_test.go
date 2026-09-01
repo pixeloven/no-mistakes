@@ -96,6 +96,42 @@ func TestRunAppliesContextEnvironmentToGitSubprocesses(t *testing.T) {
 	}
 }
 
+func TestRunAndAgentEnvironmentPreserveCapturedSigningPolicy(t *testing.T) {
+	src := initTestRepo(t)
+	dst := initTestRepo(t)
+	run(t, src, "git", "config", "--local", "commit.gpgsign", "false")
+	if err := CopyLocalCommitSettings(context.Background(), src, dst); err != nil {
+		t.Fatalf("CopyLocalCommitSettings: %v", err)
+	}
+
+	ctx := WithEnvironment(context.Background(), runenv.Overlay{Set: map[string]string{
+		"GIT_CONFIG_COUNT":   "1",
+		"GIT_CONFIG_KEY_0":   "commit.gpgsign",
+		"GIT_CONFIG_VALUE_0": "true",
+	}})
+	policy, err := RunWithCommitSigningPolicy(ctx, dst, "config", "--bool", "commit.gpgsign")
+	if err != nil || policy != "false" {
+		t.Fatalf("command signing policy = %q, %v", policy, err)
+	}
+
+	env, err := CommitSigningPolicyEnvironment(context.Background(), dst, []string{
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=safe.bareRepository",
+		"GIT_CONFIG_VALUE_0=explicit",
+	})
+	if err != nil {
+		t.Fatalf("CommitSigningPolicyEnvironment: %v", err)
+	}
+	policy, err = RunWithEnv(context.Background(), dst, env, "config", "--bool", "commit.gpgsign")
+	if err != nil || policy != "false" {
+		t.Fatalf("agent signing policy = %q, %v", policy, err)
+	}
+	barePolicy, err := RunWithEnv(context.Background(), dst, env, "config", "--get", "safe.bareRepository")
+	if err != nil || barePolicy != "explicit" {
+		t.Fatalf("preserved ambient config = %q, %v", barePolicy, err)
+	}
+}
+
 func TestRunError(t *testing.T) {
 	ctx := context.Background()
 	_, err := Run(ctx, t.TempDir(), "log")
