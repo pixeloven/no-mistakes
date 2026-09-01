@@ -623,6 +623,35 @@ func TestCommitAgentFixes_PersistsUncertifiedRangeForReview(t *testing.T) {
 	}
 }
 
+func TestCommitAgentFixes_HonorsExplicitLocalUnsignedPolicy(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, _ := setupGitRepo(t)
+	// Simulate the operator's ambient signer being unavailable while the
+	// invoking repository explicitly opts out of signing.
+	gitCmd(t, dir, "config", "commit.gpgsign", "false")
+	gitCmd(t, dir, "config", "gpg.program", filepath.Join(t.TempDir(), "missing-signer"))
+	gitCmd(t, dir, "config", "user.signingkey", "unavailable-key")
+
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			if err := os.WriteFile(filepath.Join(opts.CWD, "unsigned-fix.txt"), []byte("fixed\\n"), 0o644); err != nil {
+				return nil, err
+			}
+			return &agent.Result{Output: json.RawMessage(`{"summary":"apply unsigned fix"}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, gitCmd(t, dir, "rev-parse", "HEAD"), config.Commands{})
+	sctx.Fixing = true
+	if _, err := executeFixMode(sctx, types.StepReview, fixExecutionOptions{FallbackSummary: "apply unsigned fix"}); err != nil {
+		t.Fatalf("executeFixMode: %v", err)
+	}
+	commit := gitCmd(t, dir, "cat-file", "commit", "HEAD")
+	if strings.Contains(commit, "\\ngpgsig ") || strings.HasPrefix(commit, "gpgsig ") {
+		t.Fatalf("correction commit unexpectedly contains a signature:\\n%s", commit)
+	}
+}
+
 func TestCommitAgentFixes_BypassesMissingLegacyHuskyRuntime(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, _ := setupGitRepo(t)
