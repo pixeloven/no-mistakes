@@ -202,7 +202,6 @@ func TestRebaseStep_FixModeCallsAgent(t *testing.T) {
 				"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@test.com",
 				"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test.com",
 			)
-			cmd.Env = append(cmd.Env, opts.Env...)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return nil, fmt.Errorf("git add: %s: %w", out, err)
 			}
@@ -213,7 +212,6 @@ func TestRebaseStep_FixModeCallsAgent(t *testing.T) {
 				"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test.com",
 				"GIT_EDITOR=true",
 			)
-			cmd.Env = append(cmd.Env, opts.Env...)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return nil, fmt.Errorf("git rebase --continue: %s: %w", out, err)
 			}
@@ -240,10 +238,6 @@ func TestRebaseStep_FixModeCallsAgent(t *testing.T) {
 	}
 	if len(ag.calls) != 1 {
 		t.Fatalf("expected 1 agent call, got %d", len(ag.calls))
-	}
-	policy, err := gitutil.RunWithEnv(context.Background(), dir, ag.calls[0].Env, "config", "--bool", "commit.gpgsign")
-	if err != nil || policy != "false" {
-		t.Fatalf("agent rebase signing policy = %q, %v", policy, err)
 	}
 	if !strings.Contains(ag.calls[0].Prompt, "shared.txt") {
 		t.Error("expected agent prompt to mention conflicting file")

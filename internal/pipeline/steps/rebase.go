@@ -406,15 +406,9 @@ Instructions:
 	prompt += executionContextPromptSection(sctx.WorkDir)
 	prompt = testguidance.LateRepairPrompt(string(types.StepRebase), prompt)
 
-	agentEnv, err := git.CommitSigningPolicyEnvironment(ctx, sctx.WorkDir, nil)
-	if err != nil {
-		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")
-		return fmt.Errorf("load rebase signing policy: %w", err)
-	}
 	_, err = sctx.RunAgentContext(ctx, agent.RunOpts{
 		Prompt:     prompt,
 		CWD:        sctx.WorkDir,
-		Env:        agentEnv,
 		JSONSchema: commitSummarySchema,
 		OnChunk:    sctx.LogChunk,
 	})

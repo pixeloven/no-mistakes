@@ -640,13 +640,20 @@ func CommitSigningPolicyEnvironment(ctx context.Context, dir string, env []strin
 }
 
 func environmentValue(env []string, key string) (string, bool) {
+	if value, ok := environmentSliceValue(env, key); ok {
+		return value, true
+	}
+	return os.LookupEnv(key)
+}
+
+func environmentSliceValue(env []string, key string) (string, bool) {
 	for i := len(env) - 1; i >= 0; i-- {
 		name, value, ok := strings.Cut(env[i], "=")
 		if ok && name == key {
 			return value, true
 		}
 	}
-	return os.LookupEnv(key)
+	return "", false
 }
 
 // CommitWithLocalSigningPolicy creates a commit while preserving the invoking
@@ -764,6 +771,17 @@ func CommitSigningPolicySnapshot(ctx context.Context, dir string) (policy string
 		return "", false, fmt.Errorf("invalid commit signing policy snapshot")
 	}
 	return policy, true, nil
+}
+
+func CaptureLegacyCommitSigningPolicySnapshot(ctx context.Context, dir string) error {
+	if _, ok, err := CommitSigningPolicySnapshot(ctx, dir); err != nil || ok {
+		return err
+	}
+	policy, err := explicitRepositoryCommitSigningPolicy(ctx, dir)
+	if err != nil {
+		return err
+	}
+	return writeCommitSigningPolicySnapshot(ctx, dir, policy)
 }
 
 func writeCommitSigningPolicySnapshot(ctx context.Context, dir, policy string) error {

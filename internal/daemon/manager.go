@@ -159,6 +159,9 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if !samePath(resolveGitPath(workDir, commonDir), gateDir) {
 		return nil, fmt.Errorf("worktree does not belong to its gate repository")
 	}
+	if err := git.CaptureLegacyCommitSigningPolicySnapshot(ctx, workDir); err != nil {
+		return nil, fmt.Errorf("capture legacy commit signing policy: %w", err)
+	}
 
 	execSteps := m.steps()
 	if err := pipeline.ValidateRecoveredRun(m.db, run, execSteps); err != nil {
@@ -172,7 +175,11 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if err != nil {
 		return nil, fmt.Errorf("resolve forge profile: %w", err)
 	}
-	ag, err := newPipelineAgent(ctx, cfg, m.paths.EvidenceRoot(cfg.Test.Evidence.LocalRoot), exec.LookPath, forgeEnvironment(forgeCtx))
+	agentEnvironment, err := git.CommitSigningPolicyOverlay(ctx, workDir, forgeEnvironment(forgeCtx))
+	if err != nil {
+		return nil, fmt.Errorf("configure agent commit signing policy: %w", err)
+	}
+	ag, err := newPipelineAgent(ctx, cfg, m.paths.EvidenceRoot(cfg.Test.Evidence.LocalRoot), exec.LookPath, agentEnvironment)
 	if err != nil {
 		return nil, err
 	}
@@ -1046,6 +1053,12 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		trackStartFailure("resolve_forge_profile")
 		return "", fmt.Errorf("resolve forge profile: %w", err)
 	}
+	agentEnvironment, err := git.CommitSigningPolicyOverlay(ctx, wtDir, forgeEnvironment(forgeCtx))
+	if err != nil {
+		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure agent commit signing policy: %s", err))
+		trackStartFailure("configure_agent_signing_policy")
+		return "", fmt.Errorf("configure agent commit signing policy: %w", err)
+	}
 
 	// Create agent. In demo mode, skip resolution and use a no-op agent.
 	var ag agent.Agent
@@ -1067,7 +1080,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 				ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
 				DisableProjectSettings: cfg.DisableProjectSettings,
 				Profile:                cfg.AgentProfileFor(name),
-				Environment:            forgeEnvironment(forgeCtx),
+				Environment:            agentEnvironment,
 			})
 			if agErr != nil {
 				m.db.UpdateRunError(run.ID, fmt.Sprintf("create agent %s: %s", name, agErr))

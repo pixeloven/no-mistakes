@@ -2,9 +2,11 @@ package git
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 
 	"github.com/kunchenguid/no-mistakes/internal/runenv"
 )
@@ -18,6 +20,32 @@ func WithEnvironment(ctx context.Context, overlay runenv.Overlay) context.Contex
 		return ctx
 	}
 	return context.WithValue(ctx, environmentContextKey{}, overlay.Clone())
+}
+
+func CommitSigningPolicyOverlay(ctx context.Context, dir string, overlay runenv.Overlay) (runenv.Overlay, error) {
+	policy, ok, err := CommitSigningPolicySnapshot(ctx, dir)
+	if err != nil {
+		return runenv.Overlay{}, err
+	}
+	out := overlay.Clone()
+	if !ok || policy == "" {
+		return out, nil
+	}
+
+	count := 0
+	if value, found := environmentSliceValue(overlay.Apply(nil), "GIT_CONFIG_COUNT"); found {
+		count, err = strconv.Atoi(value)
+		if err != nil || count < 0 {
+			return runenv.Overlay{}, fmt.Errorf("invalid GIT_CONFIG_COUNT %q", value)
+		}
+	}
+	if out.Set == nil {
+		out.Set = make(map[string]string)
+	}
+	out.Set["GIT_CONFIG_COUNT"] = strconv.Itoa(count + 1)
+	out.Set[fmt.Sprintf("GIT_CONFIG_KEY_%d", count)] = "commit.gpgsign"
+	out.Set[fmt.Sprintf("GIT_CONFIG_VALUE_%d", count)] = policy
+	return out, nil
 }
 
 func nonInteractiveEnvForContext(ctx context.Context, dir string) []string {

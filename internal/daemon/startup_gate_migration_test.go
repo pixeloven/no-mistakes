@@ -175,7 +175,7 @@ func TestMigrateGateConfigsDoesNotStampUnsupportedIsolation(t *testing.T) {
 	}
 }
 
-func TestMigrateGateConfigsDefersGateOwnedByLegacyParkedRun(t *testing.T) {
+func TestMigrateGateConfigsPreservesCapturedLegacyRunPolicy(t *testing.T) {
 	p := paths.WithRoot(filepath.Join(t.TempDir(), "nm-home"))
 	if err := p.EnsureDirs(); err != nil {
 		t.Fatal(err)
@@ -188,35 +188,29 @@ func TestMigrateGateConfigsDefersGateOwnedByLegacyParkedRun(t *testing.T) {
 
 	ctx := context.Background()
 	id := "parked"
+	_, headSHA := setupTestGitRepo(t, p, database, id)
 	gateDir := p.RepoDir(id)
-	if err := git.InitBare(ctx, gateDir); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.InsertRepoWithID(id, t.TempDir(), "https://example.com/parked.git", "main"); err != nil {
+	workDir := p.WorktreeDir(id, "legacy-run")
+	if err := git.WorktreeAdd(ctx, gateDir, workDir, headSHA); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := git.RunBare(ctx, gateDir, "config", "commit.gpgsign", "false"); err != nil {
 		t.Fatal(err)
 	}
-
-	stats := migrateGateConfigsExcept(ctx, database, p, map[string]struct{}{filepath.Clean(gateDir): {}})
-	if stats.Gates != 1 || stats.Deferred != 1 || stats.Migrated != 0 || stats.Failed != 0 {
-		t.Fatalf("deferred migration stats = %+v", stats)
-	}
-	policy, err := git.RunBare(ctx, gateDir, "config", "--local", "--get", "commit.gpgsign")
-	if err != nil || policy != "false" {
-		t.Fatalf("legacy signing policy after deferral = %q, %v", policy, err)
-	}
-	if git.GateConfigCurrent(gateDir) {
-		t.Fatal("deferred gate was stamped current")
+	if err := git.CaptureLegacyCommitSigningPolicySnapshot(ctx, workDir); err != nil {
+		t.Fatal(err)
 	}
 
-	stats = migrateGateConfigs(ctx, database, p)
-	if stats.Gates != 1 || stats.Migrated != 1 || stats.Deferred != 0 || stats.Failed != 0 {
-		t.Fatalf("resumed migration stats = %+v", stats)
+	stats := migrateGateConfigs(ctx, database, p)
+	if stats.Gates != 1 || stats.Migrated != 1 || stats.Failed != 0 {
+		t.Fatalf("migration stats = %+v", stats)
 	}
-	policy, err = git.RunBare(ctx, gateDir, "config", "--local", "--get", "--default", "", "commit.gpgsign")
+	policy, err := git.RunBare(ctx, gateDir, "config", "--local", "--get", "--default", "", "commit.gpgsign")
 	if err != nil || policy != "" {
 		t.Fatalf("legacy signing policy after migration = %q, %v", policy, err)
+	}
+	policy, ok, err := git.CommitSigningPolicySnapshot(ctx, workDir)
+	if err != nil || !ok || policy != "false" {
+		t.Fatalf("captured run signing policy = %q, %t, %v", policy, ok, err)
 	}
 }

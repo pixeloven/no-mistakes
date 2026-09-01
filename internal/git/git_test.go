@@ -130,6 +130,19 @@ func TestRunAndAgentEnvironmentPreserveCapturedSigningPolicy(t *testing.T) {
 	if err != nil || barePolicy != "explicit" {
 		t.Fatalf("preserved ambient config = %q, %v", barePolicy, err)
 	}
+
+	overlay, err := CommitSigningPolicyOverlay(context.Background(), dst, runenv.Overlay{Set: map[string]string{
+		"GIT_CONFIG_COUNT":   "1",
+		"GIT_CONFIG_KEY_0":   "safe.bareRepository",
+		"GIT_CONFIG_VALUE_0": "explicit",
+	}})
+	if err != nil {
+		t.Fatalf("CommitSigningPolicyOverlay: %v", err)
+	}
+	policy, err = RunWithEnv(context.Background(), dst, overlay.Apply(nil), "config", "--bool", "commit.gpgsign")
+	if err != nil || policy != "false" {
+		t.Fatalf("persistent agent signing policy = %q, %v", policy, err)
+	}
 }
 
 func TestRunError(t *testing.T) {
