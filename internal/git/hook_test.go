@@ -792,6 +792,27 @@ func TestIsolateHooksPath_Idempotent(t *testing.T) {
 	}
 }
 
+func TestEnsureHooksPathIsolationClearsLegacySharedSigningPolicy(t *testing.T) {
+	ctx := context.Background()
+	bare := filepath.Join(t.TempDir(), "test.git")
+	if err := InitBare(ctx, bare); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, bare, "config", "--local", "commit.gpgsign", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureHooksPathIsolation(ctx, bare); err != nil {
+		t.Fatalf("EnsureHooksPathIsolation: %v", err)
+	}
+	policy, err := Run(ctx, bare, "config", "--local", "--get", "--default", "", "commit.gpgsign")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy != "" {
+		t.Fatalf("shared commit.gpgsign = %q, want unset", policy)
+	}
+}
+
 func TestIsolateHooksPath_SkipsIsolationWhenWorktreeConfigUnsupported(t *testing.T) {
 	ctx := context.Background()
 	bare := filepath.Join(t.TempDir(), "test.git")
