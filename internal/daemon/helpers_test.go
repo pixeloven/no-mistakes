@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/logstore"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
@@ -256,6 +257,7 @@ func setupTestGitRepo(t *testing.T, p *paths.Paths, d *db.DB, repoID string) (*d
 		t.Fatal(err)
 	}
 	gitCmd(t, workDir, "init")
+	gitCmd(t, workDir, "checkout", "-b", "main")
 	gitCmd(t, workDir, "config", "user.email", "test@test.com")
 	gitCmd(t, workDir, "config", "user.name", "Test")
 	gitCmd(t, workDir, "config", "commit.gpgsign", "false")
@@ -274,6 +276,9 @@ func setupTestGitRepo(t *testing.T, p *paths.Paths, d *db.DB, repoID string) (*d
 	// Create bare repo at the expected gate path.
 	bareDir := p.RepoDir(repoID)
 	gitCmd(t, "", "init", "--bare", bareDir)
+	if err := git.IsolateHooksPath(ctx, bareDir); err != nil {
+		t.Fatalf("initialize gate worktree configuration: %v", err)
+	}
 
 	// Push from work to bare so it has refs.
 	gitCmd(t, workDir, "remote", "add", "gate", bareDir)
@@ -290,8 +295,6 @@ func setupTestGitRepo(t *testing.T, p *paths.Paths, d *db.DB, repoID string) (*d
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = ctx
-
 	return repo, headSHA
 }
 

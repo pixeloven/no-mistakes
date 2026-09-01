@@ -263,7 +263,7 @@ func TestCopyLocalCommitSettings_PreservesWorktreeIdentityPrecedence(t *testing.
 	}
 	ctx = WithCommitPolicy(ctx, policy)
 	for path, contents := range map[string]string{
-		"no-mistakes/commit-identity.json":   `{"name":{"present":true,"value":"Tampered Name"},"email":{"present":true,"value":"tampered@example.com"}}`,
+		"no-mistakes/commit-identity.json":  `{"name":{"present":true,"value":"Tampered Name"},"email":{"present":true,"value":"tampered@example.com"}}`,
 		"no-mistakes/commit-signing-policy": "true\n",
 	} {
 		snapshotPath := run(t, dst, "git", "rev-parse", "--git-path", path)

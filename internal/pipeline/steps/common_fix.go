@@ -155,7 +155,16 @@ func commitPipelineCorrection(ctx context.Context, workDir, message string, logf
 }
 
 func commitStepCorrection(sctx *pipeline.StepContext, message string, hookFree bool) error {
-	args, err := git.LocalCommitPolicyArgsFromEnv(sctx.Ctx, sctx.WorkDir, stepEnvironment(sctx))
+	ctx := sctx.Ctx
+	if sctx.Run != nil && sctx.Run.CommitPolicyJSON != nil {
+		policy, err := git.DecodeCommitPolicy(*sctx.Run.CommitPolicyJSON)
+		if err != nil {
+			return err
+		}
+		ctx = git.WithCommitPolicy(ctx, policy)
+	}
+	env := git.NonInteractiveEnvFrom(stepEnvironment(sctx), sctx.WorkDir)
+	args, err := git.LocalCommitPolicyArgsFromEnv(ctx, sctx.WorkDir, env)
 	if err != nil {
 		return err
 	}

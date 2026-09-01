@@ -316,6 +316,7 @@ func TestPipeline_DocumentPlusLintIsOneAgentInvocation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert run: %v", err)
 	}
+	persistTestCommitPolicy(t, database, run, workDir)
 
 	calls := 0
 	ag := &mockAgent{

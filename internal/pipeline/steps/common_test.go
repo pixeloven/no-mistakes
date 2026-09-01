@@ -764,8 +764,12 @@ func TestCommitPipelineCorrection_ReportsCleanupFailureWithoutMaskingCommit(t *t
 	cleanupFailure := errors.New("cleanup denied")
 	var cleanedPath, warning string
 	var removeErr error
-	err := commitPipelineCorrectionWithCleanup(
-		context.Background(),
+	policy, err := git.CaptureLocalCommitSettings(context.Background(), dir, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = commitPipelineCorrectionWithCleanup(
+		git.WithCommitPolicy(context.Background(), policy),
 		dir,
 		"no-mistakes(test): apply correction",
 		func(line string) { warning = line },

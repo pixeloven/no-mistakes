@@ -100,6 +100,7 @@ func reviewSessionHarness(t *testing.T, mock *sessionMockAgent, steps []pipeline
 	if err != nil {
 		t.Fatalf("insert run: %v", err)
 	}
+	persistTestCommitPolicy(t, database, run, workDir)
 
 	cfg := &config.Config{
 		Agent:        types.AgentClaude,

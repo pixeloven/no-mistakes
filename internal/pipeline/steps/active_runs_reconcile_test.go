@@ -131,6 +131,7 @@ func setupCIGateReconcileTest(t *testing.T) (*db.DB, *paths.Paths, *db.Run, *db.
 	if err != nil {
 		t.Fatal(err)
 	}
+	persistTestCommitPolicy(t, database, run, dir)
 
 	binDir := fakeCLIBinDir(t)
 	linkTestBinary(t, binDir, "gh")

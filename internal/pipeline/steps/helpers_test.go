@@ -144,11 +144,18 @@ func setupGitRepo(t *testing.T) (string, string, string) {
 // newTestContext creates a StepContext for testing with optional config overrides.
 func newTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA string, cmds config.Commands) *pipeline.StepContext {
 	t.Helper()
-	policy, err := git.CaptureLocalCommitSettings(context.Background(), workDir, workDir)
-	if err != nil {
-		t.Fatalf("capture test commit policy: %v", err)
+	policy := git.CommitPolicy{}
+	if _, err := git.Run(context.Background(), workDir, "rev-parse", "--git-dir"); err == nil {
+		policy, err = git.CaptureLocalCommitSettings(context.Background(), workDir, workDir)
+		if err != nil {
+			t.Fatalf("capture test commit policy: %v", err)
+		}
 	}
 	policyCtx := git.WithCommitPolicy(context.Background(), policy)
+	policyJSON, err := git.EncodeCommitPolicy(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Most step tests do not exercise remote transport. Give repositories that
 	// lack an explicitly configured origin a local one so incidental upstream
@@ -174,7 +181,7 @@ func newTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA stri
 
 	return &pipeline.StepContext{
 		Ctx:  policyCtx,
-		Run:  &db.Run{ID: "run-1", RepoID: "repo-1", Branch: "refs/heads/feature", HeadSHA: headSHA, BaseSHA: baseSHA},
+		Run:  &db.Run{ID: "run-1", RepoID: "repo-1", Branch: "refs/heads/feature", HeadSHA: headSHA, BaseSHA: baseSHA, CommitPolicyJSON: &policyJSON},
 		Repo: &db.Repo{ID: "repo-1", WorkingPath: workDir, UpstreamURL: "https://github.com/test/repo", DefaultBranch: "main"},
 		// The executor resolves this from the app root in production. Tests get
 		// a per-test directory so a step under test can never write evidence
@@ -444,9 +451,31 @@ func newTestContextWithDBRecords(t *testing.T, ag agent.Agent, workDir, baseSHA,
 	if err != nil {
 		t.Fatal(err)
 	}
+	persistTestCommitPolicy(t, sctx.DB, run, workDir, *sctx.Run.CommitPolicyJSON)
 	sctx.Run = run
 	sctx.Repo = repo
 	return sctx
+}
+
+func persistTestCommitPolicy(t *testing.T, database *db.DB, run *db.Run, workDir string, encoded ...string) {
+	t.Helper()
+	policyJSON := ""
+	if len(encoded) > 0 {
+		policyJSON = encoded[0]
+	} else {
+		policy, err := git.CaptureLocalCommitSettings(context.Background(), workDir, workDir)
+		if err != nil {
+			t.Fatalf("capture test commit policy: %v", err)
+		}
+		policyJSON, err = git.EncodeCommitPolicy(policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := database.SetRunCommitPolicy(run.ID, policyJSON); err != nil {
+		t.Fatal(err)
+	}
+	run.CommitPolicyJSON = &policyJSON
 }
 
 // fakeCIGH creates a fake gh binary that responds to CI-related

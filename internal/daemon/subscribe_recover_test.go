@@ -726,6 +726,18 @@ func TestRecoverOnStartup_ReconcilesHistoricalCIGateFromCurrentPRState(t *testin
 			if err := gitpkg.WorktreeAdd(context.Background(), p.RepoDir(repo.ID), worktree, headSHA); err != nil {
 				t.Fatal(err)
 			}
+			policy, err := gitpkg.CaptureLocalCommitSettings(context.Background(), repo.WorkingPath, worktree)
+			if err != nil {
+				t.Fatal(err)
+			}
+			policyJSON, err := gitpkg.EncodeCommitPolicy(policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.SetRunCommitPolicy(run.ID, policyJSON); err != nil {
+				t.Fatal(err)
+			}
+			run.CommitPolicyJSON = &policyJSON
 			step, err := d.InsertStepResult(run.ID, types.StepCI)
 			if err != nil {
 				t.Fatal(err)

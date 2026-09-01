@@ -746,6 +746,11 @@ func newUnmovedRecoverFixture(t *testing.T, status types.RunStatus) *recoverFixt
 	if err != nil {
 		t.Fatal(err)
 	}
+	policyJSON := `{"name":{"present":false,"value":""},"email":{"present":false,"value":""},"signing":""}`
+	if err := database.SetRunCommitPolicy(run.ID, policyJSON); err != nil {
+		t.Fatal(err)
+	}
+	run.CommitPolicyJSON = &policyJSON
 	var statusErr error
 	if terminalRunStatus(status) {
 		statusErr = database.UpdateRunStatusWithVerifiedHead(run.ID, status, submitted)

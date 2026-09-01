@@ -737,7 +737,7 @@ func TestRerunSkipStepsConfiguresExecutor(t *testing.T) {
 		return []pipeline.Step{review, testStep}
 	})
 
-	_, headSHA := setupTestGitRepo(t, p, d, "skip-rerun-repo")
+	repo, headSHA := setupTestGitRepo(t, p, d, "skip-rerun-repo")
 
 	client, err := ipc.Dial(p.Socket())
 	if err != nil {
@@ -761,6 +761,7 @@ func TestRerunSkipStepsConfiguresExecutor(t *testing.T) {
 	err = client.Call(ipc.MethodRerun, &ipc.RerunParams{
 		RepoID:    "skip-rerun-repo",
 		Branch:    "main",
+		Worktree:  repo.WorkingPath,
 		SkipSteps: []types.StepName{types.StepReview},
 	}, &second)
 	if err != nil {
@@ -791,7 +792,7 @@ func TestRerunInheritsIntentFromSelectedRun(t *testing.T) {
 		return []pipeline.Step{step}
 	})
 
-	_, headSHA := setupTestGitRepo(t, p, d, "selected-rerun-repo")
+	repo, headSHA := setupTestGitRepo(t, p, d, "selected-rerun-repo")
 	client, err := ipc.Dial(p.Socket())
 	if err != nil {
 		t.Fatal(err)
@@ -831,6 +832,7 @@ func TestRerunInheritsIntentFromSelectedRun(t *testing.T) {
 		RepoID:        "selected-rerun-repo",
 		Branch:        "main",
 		PreviousRunID: first.RunID,
+		Worktree:      repo.WorkingPath,
 	}, &rerun)
 	if err != nil {
 		t.Fatal(err)

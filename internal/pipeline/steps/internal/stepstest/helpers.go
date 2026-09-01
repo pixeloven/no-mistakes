@@ -19,6 +19,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -141,6 +142,14 @@ func SetupGitRepo(t *testing.T) (string, string, string) {
 // newTestContext creates a StepContext for testing with optional config overrides.
 func NewTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA string, cmds config.Commands) *pipeline.StepContext {
 	t.Helper()
+	policy := git.CommitPolicy{
+		Name:  git.CommitIdentityValue{Present: true, Value: "test"},
+		Email: git.CommitIdentityValue{Present: true, Value: "test@test.com"},
+	}
+	policyJSON, err := git.EncodeCommitPolicy(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Most step tests do not exercise remote transport. Give repositories that
 	// lack an explicitly configured origin a local one so incidental upstream
@@ -165,8 +174,8 @@ func NewTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA stri
 	t.Cleanup(func() { database.Close() })
 
 	return &pipeline.StepContext{
-		Ctx:  context.Background(),
-		Run:  &db.Run{ID: "run-1", RepoID: "repo-1", Branch: "refs/heads/feature", HeadSHA: headSHA, BaseSHA: baseSHA},
+		Ctx:  git.WithCommitPolicy(context.Background(), policy),
+		Run:  &db.Run{ID: "run-1", RepoID: "repo-1", Branch: "refs/heads/feature", HeadSHA: headSHA, BaseSHA: baseSHA, CommitPolicyJSON: &policyJSON},
 		Repo: &db.Repo{ID: "repo-1", WorkingPath: workDir, UpstreamURL: "https://github.com/test/repo", DefaultBranch: "main"},
 		// The executor resolves this from the app root in production. Tests get
 		// a per-test directory so a step under test can never write evidence
@@ -546,6 +555,10 @@ func NewTestContextWithDBRecords(t *testing.T, ag agent.Agent, workDir, baseSHA,
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := sctx.DB.SetRunCommitPolicy(run.ID, *sctx.Run.CommitPolicyJSON); err != nil {
+		t.Fatal(err)
+	}
+	run.CommitPolicyJSON = sctx.Run.CommitPolicyJSON
 	sctx.Run = run
 	sctx.Repo = repo
 	return sctx
