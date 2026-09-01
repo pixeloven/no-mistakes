@@ -221,6 +221,42 @@ func TestCopyLocalCommitSettings_ExplicitUnsignedPolicySurvivesFailingSigner(t *
 	}
 }
 
+func TestCopyLocalCommitSettings_FallbackClearsRemovedSigningPolicy(t *testing.T) {
+	ctx := context.Background()
+	src := initTestRepo(t)
+	dst := initTestRepo(t)
+	linked := filepath.Join(t.TempDir(), "linked")
+	run(t, dst, "git", "worktree", "add", "--detach", linked, "HEAD")
+	run(t, src, "git", "config", "commit.gpgsign", "false")
+
+	if err := CopyLocalCommitSettings(ctx, src, linked); err != nil {
+		t.Fatalf("initial CopyLocalCommitSettings: %v", err)
+	}
+	run(t, src, "git", "config", "--unset-all", "commit.gpgsign")
+	if err := CopyLocalCommitSettings(ctx, src, linked); err != nil {
+		t.Fatalf("updated CopyLocalCommitSettings: %v", err)
+	}
+
+	writeFile(t, filepath.Join(linked, "generated-fix.txt"), "generated review fix\n")
+	run(t, linked, "git", "add", "generated-fix.txt")
+	before := run(t, linked, "git", "rev-parse", "HEAD")
+	env := []string{
+		"GIT_CONFIG_COUNT=3",
+		"GIT_CONFIG_KEY_0=commit.gpgsign",
+		"GIT_CONFIG_VALUE_0=true",
+		"GIT_CONFIG_KEY_1=gpg.program",
+		"GIT_CONFIG_VALUE_1=" + filepath.Join(t.TempDir(), "missing-signer"),
+		"GIT_CONFIG_KEY_2=user.signingkey",
+		"GIT_CONFIG_VALUE_2=test-signing-key",
+	}
+	if err := CommitWithLocalSigningPolicyFromEnv(ctx, linked, env, "pipeline review fix", ""); err == nil {
+		t.Fatal("commit unexpectedly ignored ambient signing after source policy removal")
+	}
+	if got := run(t, linked, "git", "rev-parse", "HEAD"); got != before {
+		t.Fatalf("failed signed commit moved HEAD to %s, want %s", got, before)
+	}
+}
+
 func TestCopyLocalCommitSettings_PreservesSignedAndDefaultBehavior(t *testing.T) {
 	tests := []struct {
 		name         string

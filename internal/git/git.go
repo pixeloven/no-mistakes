@@ -637,9 +637,9 @@ func CommitWithLocalSigningPolicyFromEnv(ctx context.Context, dir string, env []
 
 // CopyLocalCommitSettings copies repository-local commit settings from srcDir
 // into dstDir. It carries user.name, user.email, and an explicitly configured
-// commit.gpgsign value. Missing values in srcDir are ignored, so ordinary Git
-// configuration precedence remains authoritative when the source repository
-// has not opted into or out of commit signing.
+// commit.gpgsign value. Missing values in srcDir are removed from the selected
+// destination scope so ordinary Git configuration precedence remains
+// authoritative.
 //
 // The write into dstDir uses per-worktree scope (`git config --worktree`) when
 // the repository has worktree config enabled. dstDir is typically a linked
@@ -651,29 +651,37 @@ func CommitWithLocalSigningPolicyFromEnv(ctx context.Context, dir string, env []
 // <bare>/worktrees/<id>/config.worktree, so concurrent startups never contend.
 // Older Git without `--worktree` support falls back to `--local`.
 func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
+	scope, err := localCommitSettingsScope(ctx, dstDir)
+	if err != nil {
+		return err
+	}
 	for _, key := range []string{"user.name", "user.email", "commit.gpgsign"} {
 		value, err := Run(ctx, srcDir, "config", "--local", "--get", "--default", "", key)
 		if err != nil {
 			return err
 		}
 		if value == "" {
+			if _, err := Run(ctx, dstDir, "config", scope, "--unset-all", key); err != nil && !isConfigKeyMissing(err) {
+				return err
+			}
 			continue
 		}
-		if _, err := Run(ctx, dstDir, "config", "--worktree", key, value); err != nil {
-			if !WorktreeConfigUnavailable(err) {
-				return err
-			}
-			// Per-worktree config is not usable here (Git too old for the
-			// flag, or the repo has multiple worktrees without
-			// extensions.worktreeConfig enabled). Fall back to the shared
-			// local config. Such gates also lack per-worktree isolation, so
-			// this matches the legacy behavior.
-			if _, err := Run(ctx, dstDir, "config", "--local", key, value); err != nil {
-				return err
-			}
+		if _, err := Run(ctx, dstDir, "config", scope, key, value); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func localCommitSettingsScope(ctx context.Context, dir string) (string, error) {
+	_, err := Run(ctx, dir, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
+	if err == nil {
+		return "--worktree", nil
+	}
+	if WorktreeConfigUnavailable(err) {
+		return "--local", nil
+	}
+	return "", err
 }
 
 // WorktreeConfigUnavailable reports whether `git config --worktree` cannot be
