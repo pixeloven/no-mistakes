@@ -252,6 +252,8 @@ func TestCopyLocalCommitSettings_PreservesWorktreeIdentityPrecedence(t *testing.
 	if err := CopyLocalCommitSettings(ctx, src, dst); err != nil {
 		t.Fatalf("CopyLocalCommitSettings failed: %v", err)
 	}
+	run(t, dst, "git", "config", "--worktree", "user.name", "Mutated Name")
+	run(t, dst, "git", "config", "--worktree", "user.email", "mutated@example.com")
 	writeFile(t, filepath.Join(dst, "generated-fix.txt"), "generated review fix\n")
 	run(t, dst, "git", "add", "generated-fix.txt")
 	if err := CommitWithLocalCommitPolicy(ctx, dst, "pipeline review fix", ""); err != nil {
@@ -259,6 +261,48 @@ func TestCopyLocalCommitSettings_PreservesWorktreeIdentityPrecedence(t *testing.
 	}
 	if got := run(t, dst, "git", "log", "-1", "--format=%an|%ae"); got != "Worktree Name|worktree@example.com" {
 		t.Fatalf("correction author = %q, want worktree identity", got)
+	}
+}
+
+func TestCopyLocalCommitSettings_PreservesExplicitEmptyIdentity(t *testing.T) {
+	ctx := context.Background()
+	src := initTestRepo(t)
+	dst := initTestRepo(t)
+	run(t, src, "git", "config", "extensions.worktreeConfig", "true")
+	run(t, src, "git", "config", "--local", "user.name", "Local Name")
+	run(t, src, "git", "config", "--worktree", "user.name", "")
+
+	if err := CopyLocalCommitSettings(ctx, src, dst); err != nil {
+		t.Fatalf("CopyLocalCommitSettings failed: %v", err)
+	}
+	writeFile(t, filepath.Join(dst, "generated-fix.txt"), "generated review fix\n")
+	run(t, dst, "git", "add", "generated-fix.txt")
+	before := run(t, dst, "git", "rev-parse", "HEAD")
+	if err := CommitWithLocalCommitPolicy(ctx, dst, "pipeline review fix", ""); err == nil {
+		t.Fatal("pipeline correction ignored explicitly empty identity")
+	}
+	if got := run(t, dst, "git", "rev-parse", "HEAD"); got != before {
+		t.Fatalf("failed commit moved HEAD to %s, want %s", got, before)
+	}
+}
+
+func TestEnsureCommitIdentitySnapshot_FreezesRecoveredIdentity(t *testing.T) {
+	ctx := context.Background()
+	dir := initTestRepo(t)
+	run(t, dir, "git", "config", "--worktree", "user.name", "Recovered Name")
+	run(t, dir, "git", "config", "--worktree", "user.email", "recovered@example.com")
+	if err := EnsureCommitIdentitySnapshot(ctx, dir); err != nil {
+		t.Fatalf("EnsureCommitIdentitySnapshot failed: %v", err)
+	}
+	run(t, dir, "git", "config", "--worktree", "user.name", "Mutated Name")
+	run(t, dir, "git", "config", "--worktree", "user.email", "mutated@example.com")
+	writeFile(t, filepath.Join(dir, "recovered-fix.txt"), "recovered review fix\n")
+	run(t, dir, "git", "add", "recovered-fix.txt")
+	if err := CommitWithLocalCommitPolicy(ctx, dir, "recovered review fix", ""); err != nil {
+		t.Fatalf("recovered correction commit failed: %v", err)
+	}
+	if got := run(t, dir, "git", "log", "-1", "--format=%an|%ae"); got != "Recovered Name|recovered@example.com" {
+		t.Fatalf("recovered correction author = %q, want captured identity", got)
 	}
 }
 

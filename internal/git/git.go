@@ -3,6 +3,7 @@ package git
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -605,14 +606,18 @@ func localCommitPolicyEntries(ctx context.Context, dir string, env []string) ([]
 		return nil, err
 	}
 	entries := make([]commitConfigEntry, 0, 3)
-	for _, key := range []string{"user.name", "user.email"} {
-		value, err := RunWithEnv(ctx, dir, env, "config", "--worktree", "--get", "--default", "", key)
-		if err != nil {
-			return nil, err
-		}
-		if value != "" {
-			entries = append(entries, commitConfigEntry{key: key, value: value})
-		}
+	identity, ok, err := readCommitIdentitySnapshot(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("commit identity snapshot is missing")
+	}
+	if identity.Name.Present {
+		entries = append(entries, commitConfigEntry{key: "user.name", value: identity.Name.Value})
+	}
+	if identity.Email.Present {
+		entries = append(entries, commitConfigEntry{key: "user.email", value: identity.Email.Value})
 	}
 	policy, ok, err := CommitSigningPolicySnapshot(ctx, dir)
 	if err != nil {
@@ -682,8 +687,8 @@ func CommitWithLocalCommitPolicyFromEnv(ctx context.Context, dir string, env []s
 	return err
 }
 
-// CopyLocalCommitSettings copies repository-local identity from srcDir into
-// dstDir and captures the run's commit signing policy.
+// CopyLocalCommitSettings captures the repository-local commit identity and
+// signing policy from srcDir and configures them for the run in dstDir.
 //
 // The write into dstDir uses per-worktree scope (`git config --worktree`).
 // dstDir is typically a linked worktree of the shared gate bare repo, where an
@@ -697,15 +702,21 @@ func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
 	if err := RequireWorktreeCommitSettings(ctx, dstDir); err != nil {
 		return err
 	}
-	for _, key := range []string{"user.name", "user.email"} {
-		value, err := explicitRepositoryCommitIdentity(ctx, srcDir, key)
-		if err != nil {
-			return err
-		}
-		if value == "" {
+	identity, err := captureCommitIdentitySnapshot(ctx, srcDir)
+	if err != nil {
+		return err
+	}
+	for _, setting := range []struct {
+		key   string
+		value commitIdentityValue
+	}{
+		{key: "user.name", value: identity.Name},
+		{key: "user.email", value: identity.Email},
+	} {
+		if !setting.value.Present {
 			continue
 		}
-		if _, err := Run(ctx, dstDir, "config", "--worktree", key, value); err != nil {
+		if _, err := Run(ctx, dstDir, "config", "--worktree", setting.key, setting.value.Value); err != nil {
 			return err
 		}
 	}
@@ -718,22 +729,117 @@ func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
 			return err
 		}
 	}
+	if err := writeCommitIdentitySnapshot(ctx, dstDir, identity); err != nil {
+		return err
+	}
 	if err := writeCommitSigningPolicySnapshot(ctx, dstDir, policy); err != nil {
 		return err
 	}
 	return nil
 }
 
-func explicitRepositoryCommitIdentity(ctx context.Context, dir, key string) (string, error) {
-	value, err := Run(ctx, dir, "config", "--worktree", "--get", "--default", "", key)
+type commitIdentityValue struct {
+	Present bool   `json:"present"`
+	Value   string `json:"value"`
+}
+
+type commitIdentitySnapshot struct {
+	Name  commitIdentityValue `json:"name"`
+	Email commitIdentityValue `json:"email"`
+}
+
+const commitIdentitySnapshotPath = "no-mistakes/commit-identity.json"
+
+func captureCommitIdentitySnapshot(ctx context.Context, dir string) (commitIdentitySnapshot, error) {
+	name, err := explicitRepositoryCommitIdentity(ctx, dir, "user.name")
+	if err != nil {
+		return commitIdentitySnapshot{}, err
+	}
+	email, err := explicitRepositoryCommitIdentity(ctx, dir, "user.email")
+	if err != nil {
+		return commitIdentitySnapshot{}, err
+	}
+	return commitIdentitySnapshot{Name: name, Email: email}, nil
+}
+
+func explicitRepositoryCommitIdentity(ctx context.Context, dir, key string) (commitIdentityValue, error) {
+	value, err := repositoryCommitIdentityAtScope(ctx, dir, "--worktree", key)
 	if err != nil {
 		if !WorktreeConfigUnavailable(err) {
-			return "", err
+			return commitIdentityValue{}, err
 		}
-	} else if value != "" {
+	} else if value.Present {
 		return value, nil
 	}
-	return Run(ctx, dir, "config", "--local", "--get", "--default", "", key)
+	return repositoryCommitIdentityAtScope(ctx, dir, "--local", key)
+}
+
+func repositoryCommitIdentityAtScope(ctx context.Context, dir, scope, key string) (commitIdentityValue, error) {
+	value, err := Run(ctx, dir, "config", scope, "--get", key)
+	if err == nil {
+		return commitIdentityValue{Present: true, Value: value}, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return commitIdentityValue{}, nil
+	}
+	return commitIdentityValue{}, err
+}
+
+func EnsureCommitIdentitySnapshot(ctx context.Context, dir string) error {
+	if _, ok, err := readCommitIdentitySnapshot(ctx, dir); err != nil || ok {
+		return err
+	}
+	identity, err := captureCommitIdentitySnapshot(ctx, dir)
+	if err != nil {
+		return err
+	}
+	return writeCommitIdentitySnapshot(ctx, dir, identity)
+}
+
+func readCommitIdentitySnapshot(ctx context.Context, dir string) (commitIdentitySnapshot, bool, error) {
+	path, err := commitIdentityPath(ctx, dir)
+	if err != nil {
+		return commitIdentitySnapshot{}, false, err
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return commitIdentitySnapshot{}, false, nil
+	}
+	if err != nil {
+		return commitIdentitySnapshot{}, false, err
+	}
+	var identity commitIdentitySnapshot
+	if err := json.Unmarshal(data, &identity); err != nil {
+		return commitIdentitySnapshot{}, false, fmt.Errorf("invalid commit identity snapshot: %w", err)
+	}
+	return identity, true, nil
+}
+
+func writeCommitIdentitySnapshot(ctx context.Context, dir string, identity commitIdentitySnapshot) error {
+	path, err := commitIdentityPath(ctx, dir)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(identity)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return writeGateFileAtomic(path, append(data, '\n'), 0o644, ".commit-identity-*")
+}
+
+func commitIdentityPath(ctx context.Context, dir string) (string, error) {
+	path, err := Run(ctx, dir, "rev-parse", "--git-path", commitIdentitySnapshotPath)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(dir, path)
+	}
+	return filepath.Clean(path), nil
 }
 
 func explicitRepositoryCommitSigningPolicy(ctx context.Context, dir string) (string, error) {
