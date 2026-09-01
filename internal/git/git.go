@@ -818,7 +818,7 @@ func repositoryCommitIdentityAtScope(ctx context.Context, dir, scope, key string
 }
 
 func explicitRepositoryCommitSigningPolicy(ctx context.Context, dir string) (string, error) {
-	policy, err := Run(ctx, dir, "config", "--worktree", "--bool", "--get", "--default", "", "commit.gpgsign")
+	policy, err := repositoryCommitSigningPolicyAtScope(ctx, dir, "--worktree")
 	if err != nil {
 		if !WorktreeConfigUnavailable(err) {
 			return "", err
@@ -826,7 +826,19 @@ func explicitRepositoryCommitSigningPolicy(ctx context.Context, dir string) (str
 	} else if policy != "" {
 		return policy, nil
 	}
-	return Run(ctx, dir, "config", "--local", "--bool", "--get", "--default", "", "commit.gpgsign")
+	return repositoryCommitSigningPolicyAtScope(ctx, dir, "--local")
+}
+
+func repositoryCommitSigningPolicyAtScope(ctx context.Context, dir, scope string) (string, error) {
+	policy, err := Run(ctx, dir, "config", scope, "--bool", "--get", "commit.gpgsign")
+	if err == nil {
+		return policy, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return "", nil
+	}
+	return "", err
 }
 
 func RequireWorktreeCommitSettings(ctx context.Context, dir string) error {

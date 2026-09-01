@@ -75,6 +75,9 @@ func TestPushReceivedCapturesInitiatingLinkedWorktreePolicy(t *testing.T) {
 		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
 	})
 	repo, headSHA := setupTestGitRepo(t, p, d, "linked-policy-repo")
+	if err := git.IsolateHooksPath(context.Background(), p.RepoDir(repo.ID)); err != nil {
+		t.Fatalf("initialize gate worktree configuration: %v", err)
+	}
 	gitCmd(t, repo.WorkingPath, "config", "extensions.worktreeConfig", "true")
 	linkedWorktree := filepath.Join(t.TempDir(), "feature")
 	gitCmd(t, repo.WorkingPath, "worktree", "add", "-b", "feature", linkedWorktree)
@@ -282,9 +285,6 @@ func TestPushReceivedCarriesExplicitUnsignedPolicyIntoRunWorktree(t *testing.T) 
 	if err := git.IsolateHooksPath(context.Background(), p.RepoDir(repo.ID)); err != nil {
 		t.Fatalf("isolate gate worktree config: %v", err)
 	}
-	gitCmd(t, p.RepoDir(repo.ID), "config", "commit.gpgsign", "true")
-	gitCmd(t, p.RepoDir(repo.ID), "config", "gpg.program", filepath.Join(t.TempDir(), "missing-signer"))
-	gitCmd(t, p.RepoDir(repo.ID), "config", "user.signingkey", "test-signing-key")
 
 	client, err := ipc.Dial(p.Socket())
 	if err != nil {

@@ -629,6 +629,9 @@ func TestCommitAgentFixes_HonorsExplicitLocalUnsignedPolicy(t *testing.T) {
 	gitCmd(t, sourceDir, "config", "commit.gpgsign", "false")
 	gateDir, baseSHA, headSHA := setupGitRepo(t)
 	gitCmd(t, gateDir, "config", "extensions.worktreeConfig", "true")
+	for _, key := range []string{"commit.gpgsign", "user.name", "user.email"} {
+		gitCmd(t, gateDir, "config", "--local", "--unset-all", key)
+	}
 	workDir := filepath.Join(t.TempDir(), "gate-worktree")
 	gitCmd(t, gateDir, "worktree", "add", "--detach", workDir, headSHA)
 	if err := git.CopyLocalCommitSettings(context.Background(), sourceDir, workDir); err != nil {
