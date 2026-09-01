@@ -239,6 +239,29 @@ func TestCopyLocalCommitSettings(t *testing.T) {
 	}
 }
 
+func TestCopyLocalCommitSettings_PreservesWorktreeIdentityPrecedence(t *testing.T) {
+	ctx := context.Background()
+	src := initTestRepo(t)
+	dst := initTestRepo(t)
+	run(t, src, "git", "config", "extensions.worktreeConfig", "true")
+	run(t, src, "git", "config", "--local", "user.name", "Local Name")
+	run(t, src, "git", "config", "--local", "user.email", "local@example.com")
+	run(t, src, "git", "config", "--worktree", "user.name", "Worktree Name")
+	run(t, src, "git", "config", "--worktree", "user.email", "worktree@example.com")
+
+	if err := CopyLocalCommitSettings(ctx, src, dst); err != nil {
+		t.Fatalf("CopyLocalCommitSettings failed: %v", err)
+	}
+	writeFile(t, filepath.Join(dst, "generated-fix.txt"), "generated review fix\n")
+	run(t, dst, "git", "add", "generated-fix.txt")
+	if err := CommitWithLocalCommitPolicy(ctx, dst, "pipeline review fix", ""); err != nil {
+		t.Fatalf("pipeline correction commit failed: %v", err)
+	}
+	if got := run(t, dst, "git", "log", "-1", "--format=%an|%ae"); got != "Worktree Name|worktree@example.com" {
+		t.Fatalf("correction author = %q, want worktree identity", got)
+	}
+}
+
 func TestCopyLocalCommitSettings_ExplicitUnsignedPolicySurvivesFailingSigner(t *testing.T) {
 	ctx := context.Background()
 	src := initTestRepo(t)

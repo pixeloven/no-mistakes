@@ -698,7 +698,7 @@ func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
 		return err
 	}
 	for _, key := range []string{"user.name", "user.email"} {
-		value, err := Run(ctx, srcDir, "config", "--local", "--get", "--default", "", key)
+		value, err := explicitRepositoryCommitIdentity(ctx, srcDir, key)
 		if err != nil {
 			return err
 		}
@@ -722,6 +722,18 @@ func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
 		return err
 	}
 	return nil
+}
+
+func explicitRepositoryCommitIdentity(ctx context.Context, dir, key string) (string, error) {
+	value, err := Run(ctx, dir, "config", "--worktree", "--get", "--default", "", key)
+	if err != nil {
+		if !WorktreeConfigUnavailable(err) {
+			return "", err
+		}
+	} else if value != "" {
+		return value, nil
+	}
+	return Run(ctx, dir, "config", "--local", "--get", "--default", "", key)
 }
 
 func explicitRepositoryCommitSigningPolicy(ctx context.Context, dir string) (string, error) {
