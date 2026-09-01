@@ -2,6 +2,7 @@ package gate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -360,6 +361,46 @@ func TestInitIsIdempotent(t *testing.T) {
 	}
 	if dbRepo == nil || dbRepo.ID != first.ID {
 		t.Errorf("expected single repo record %q, got %+v", first.ID, dbRepo)
+	}
+}
+
+func TestInitRefreshClearsLegacySharedCommitSettings(t *testing.T) {
+	workDir := setupTestRepo(t)
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	d := openTestDB(t, p)
+	ctx := context.Background()
+	repo, _, err := Init(ctx, d, p, workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bareDir := p.RepoDir(repo.ID)
+	for key, value := range map[string]string{
+		"commit.gpgsign": "false",
+		"user.name":      "no-mistakes:config-key-absent",
+		"user.email":     "legacy@example.com",
+	} {
+		if _, err := gitpkg.RunBare(ctx, bareDir, "config", "--local", key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, created, err := Init(ctx, d, p, workDir); err != nil {
+		t.Fatalf("refresh init: %v", err)
+	} else if created {
+		t.Fatal("refresh unexpectedly created a new gate")
+	}
+	for _, key := range []string{"commit.gpgsign", "user.name", "user.email"} {
+		value, err := gitpkg.RunBare(ctx, bareDir, "config", "--local", "--get", key)
+		if err == nil {
+			t.Fatalf("legacy shared %s remains %q after refresh", key, value)
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			t.Fatalf("read cleared legacy shared %s: %v", key, err)
+		}
 	}
 }
 

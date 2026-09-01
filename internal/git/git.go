@@ -818,16 +818,43 @@ func RequireWorktreeCommitSettings(ctx context.Context, dir string) error {
 		return err
 	}
 	for _, key := range []string{"commit.gpgsign", "user.name", "user.email"} {
-		_, err := Run(ctx, dir, "config", "--local", "--get", key)
-		if err == nil {
+		present, err := configValuePresentAtScope(ctx, dir, "--local", key)
+		if err != nil {
+			return err
+		}
+		if present {
 			return fmt.Errorf("concurrent autonomous runs require isolated worktree commit settings; shared gate config contains %s; reinitialize the gate before retrying", key)
 		}
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+	}
+	return nil
+}
+
+func ClearLegacySharedCommitSettings(ctx context.Context, dir string) error {
+	for _, key := range []string{"commit.gpgsign", "user.name", "user.email"} {
+		present, err := configValuePresentAtScope(ctx, dir, "--local", key)
+		if err != nil {
+			return err
+		}
+		if !present {
+			continue
+		}
+		if _, err := Run(ctx, dir, "config", "--local", "--unset-all", key); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func configValuePresentAtScope(ctx context.Context, dir, scope, key string) (bool, error) {
+	_, err := Run(ctx, dir, "config", scope, "--get", key)
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
 func isLinkedWorktree(ctx context.Context, dir string) (bool, error) {

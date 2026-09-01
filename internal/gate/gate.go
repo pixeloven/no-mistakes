@@ -207,6 +207,11 @@ func provisionGate(ctx context.Context, bareDir, absRoot, upstreamURL, reposDir 
 	if err != nil {
 		return fmt.Errorf("isolate hooks path: %w", err)
 	}
+	if refresh {
+		if err := git.ClearLegacySharedCommitSettings(ctx, bareDir); err != nil {
+			return fmt.Errorf("clear legacy shared commit settings: %w", err)
+		}
+	}
 	if isolated {
 		if err := git.MarkGateConfigCurrent(bareDir); err != nil {
 			return fmt.Errorf("stamp gate config: %w", err)
