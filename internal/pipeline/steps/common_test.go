@@ -629,6 +629,7 @@ func TestCommitAgentFixes_HonorsExplicitLocalUnsignedPolicy(t *testing.T) {
 	gitCmd(t, sourceDir, "config", "commit.gpgsign", "false")
 	gateDir, baseSHA, headSHA := setupGitRepo(t)
 	gitCmd(t, gateDir, "config", "extensions.worktreeConfig", "true")
+	gitCmd(t, gateDir, "config", "--local", "commit.gpgsign", "false")
 	for _, key := range []string{"commit.gpgsign", "user.name", "user.email"} {
 		gitCmd(t, gateDir, "config", "--local", "--unset-all", key)
 	}
@@ -668,6 +669,7 @@ func TestCommitAgentFixes_HonorsExplicitLocalUnsignedPolicy(t *testing.T) {
 	if strings.Contains(commit, "\\ngpgsig ") || strings.HasPrefix(commit, "gpgsig ") {
 		t.Fatalf("correction commit unexpectedly contains a signature:\\n%s", commit)
 	}
+	t.Logf("correction commit %s used captured commit.gpgsign=false and contains no gpgsig header", gitCmd(t, workDir, "rev-parse", "HEAD"))
 }
 
 func TestCommitStepCorrection_RejectsUnsupportedWorktreeConfig(t *testing.T) {

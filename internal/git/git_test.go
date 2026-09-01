@@ -500,8 +500,9 @@ func TestCopyLocalCommitSettings_PreservesSignedAndDefaultBehavior(t *testing.T)
 			if err := CopyLocalCommitSettings(ctx, src, dst); err != nil {
 				t.Fatalf("CopyLocalCommitSettings failed: %v", err)
 			}
-			if got := run(t, dst, "git", "config", "--get", "commit.gpgsign"); got != tt.wantPolicy {
-				t.Fatalf("commit.gpgsign = %q, want %q", got, tt.wantPolicy)
+			effectivePolicy := run(t, dst, "git", "config", "--get", "commit.gpgsign")
+			if effectivePolicy != tt.wantPolicy {
+				t.Fatalf("commit.gpgsign = %q, want %q", effectivePolicy, tt.wantPolicy)
 			}
 			writeFile(t, filepath.Join(dst, "generated-fix.txt"), "generated review fix\n")
 			run(t, dst, "git", "add", "generated-fix.txt")
@@ -513,6 +514,7 @@ func TestCopyLocalCommitSettings_PreservesSignedAndDefaultBehavior(t *testing.T)
 			if got := run(t, dst, "git", "diff", "--cached", "--name-only"); got != "generated-fix.txt" {
 				t.Fatalf("failed signed commit lost staged fixes: %q", got)
 			}
+			t.Logf("source commit.gpgsign=%q preserved effective commit.gpgsign=%q; unavailable signer rejected the commit without losing the staged fix", tt.sourcePolicy, effectivePolicy)
 		})
 	}
 }
