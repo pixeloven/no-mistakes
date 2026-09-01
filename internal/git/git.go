@@ -786,15 +786,15 @@ func repositoryCommitIdentityAtScope(ctx context.Context, dir, scope, key string
 	return commitIdentityValue{}, err
 }
 
-func EnsureCommitIdentitySnapshot(ctx context.Context, dir string) error {
-	if _, ok, err := readCommitIdentitySnapshot(ctx, dir); err != nil || ok {
-		return err
-	}
-	identity, err := captureCommitIdentitySnapshot(ctx, dir)
+func RequireCommitIdentitySnapshot(ctx context.Context, dir string) error {
+	_, ok, err := readCommitIdentitySnapshot(ctx, dir)
 	if err != nil {
 		return err
 	}
-	return writeCommitIdentitySnapshot(ctx, dir, identity)
+	if !ok {
+		return fmt.Errorf("commit identity snapshot is missing; the legacy run cannot be safely recovered")
+	}
+	return nil
 }
 
 func readCommitIdentitySnapshot(ctx context.Context, dir string) (commitIdentitySnapshot, bool, error) {

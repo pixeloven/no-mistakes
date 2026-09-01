@@ -286,26 +286,6 @@ func TestCopyLocalCommitSettings_PreservesExplicitEmptyIdentity(t *testing.T) {
 	}
 }
 
-func TestEnsureCommitIdentitySnapshot_FreezesRecoveredIdentity(t *testing.T) {
-	ctx := context.Background()
-	dir := initTestRepo(t)
-	run(t, dir, "git", "config", "--worktree", "user.name", "Recovered Name")
-	run(t, dir, "git", "config", "--worktree", "user.email", "recovered@example.com")
-	if err := EnsureCommitIdentitySnapshot(ctx, dir); err != nil {
-		t.Fatalf("EnsureCommitIdentitySnapshot failed: %v", err)
-	}
-	run(t, dir, "git", "config", "--worktree", "user.name", "Mutated Name")
-	run(t, dir, "git", "config", "--worktree", "user.email", "mutated@example.com")
-	writeFile(t, filepath.Join(dir, "recovered-fix.txt"), "recovered review fix\n")
-	run(t, dir, "git", "add", "recovered-fix.txt")
-	if err := CommitWithLocalCommitPolicy(ctx, dir, "recovered review fix", ""); err != nil {
-		t.Fatalf("recovered correction commit failed: %v", err)
-	}
-	if got := run(t, dir, "git", "log", "-1", "--format=%an|%ae"); got != "Recovered Name|recovered@example.com" {
-		t.Fatalf("recovered correction author = %q, want captured identity", got)
-	}
-}
-
 func TestCopyLocalCommitSettings_ExplicitUnsignedPolicySurvivesFailingSigner(t *testing.T) {
 	ctx := context.Background()
 	src := initTestRepo(t)

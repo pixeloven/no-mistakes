@@ -162,8 +162,8 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if err := git.RequireWorktreeCommitSettings(ctx, workDir); err != nil {
 		return nil, err
 	}
-	if err := git.EnsureCommitIdentitySnapshot(ctx, workDir); err != nil {
-		return nil, fmt.Errorf("capture recovered commit identity: %w", err)
+	if err := git.RequireCommitIdentitySnapshot(ctx, workDir); err != nil {
+		return nil, fmt.Errorf("recover commit identity: %w", err)
 	}
 
 	execSteps := m.steps()

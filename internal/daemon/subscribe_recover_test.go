@@ -518,7 +518,14 @@ func TestRecoverOnStartup_ResumesParkedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	worktree := p.WorktreeDir(repo.ID, run.ID)
-	if err := gitpkg.WorktreeAdd(context.Background(), p.RepoDir(repo.ID), worktree, headSHA); err != nil {
+	ctx := context.Background()
+	if err := gitpkg.IsolateHooksPath(ctx, p.RepoDir(repo.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gitpkg.WorktreeAdd(ctx, p.RepoDir(repo.ID), worktree, headSHA); err != nil {
+		t.Fatal(err)
+	}
+	if err := gitpkg.CopyLocalCommitSettings(ctx, repo.WorkingPath, worktree); err != nil {
 		t.Fatal(err)
 	}
 	step, err := d.InsertStepResult(run.ID, types.StepReview)
@@ -622,6 +629,47 @@ func TestRecoverOnStartup_ResumesParkedRun(t *testing.T) {
 			t.Fatalf("recovered worktree still exists after cleanup: %s", worktree)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestPrepareRecoveredRun_RejectsLegacyIdentityWithoutSnapshot(t *testing.T) {
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	repo, headSHA := setupTestGitRepo(t, p, d, "legacy-identity-recovery")
+	ctx := context.Background()
+	if err := gitpkg.IsolateHooksPath(ctx, p.RepoDir(repo.ID)); err != nil {
+		t.Fatal(err)
+	}
+	run, err := d.InsertRun(repo.ID, "feature", headSHA, headSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetRunAwaitingAgent(run.ID); err != nil {
+		t.Fatal(err)
+	}
+	worktree := p.WorktreeDir(repo.ID, run.ID)
+	if err := gitpkg.WorktreeAdd(ctx, p.RepoDir(repo.ID), worktree, headSHA); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := d.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = NewRunManager(d, p, nil).prepareRecoveredRun(ctx, stored)
+	if err == nil || !strings.Contains(err.Error(), "identity snapshot is missing") {
+		t.Fatalf("legacy recovery error = %v", err)
 	}
 }
 
