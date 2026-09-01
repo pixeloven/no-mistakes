@@ -666,19 +666,12 @@ func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
 			return err
 		}
 	}
-	localPolicy, err := Run(ctx, srcDir, "config", "--local", "--bool", "--get", "--default", "", "commit.gpgsign")
+	policy, err := explicitRepositoryCommitSigningPolicy(ctx, srcDir)
 	if err != nil {
 		return err
 	}
-	policy := localPolicy
-	if policy == "" {
-		policy, err = Run(ctx, srcDir, "config", "--bool", "--get", "--default", "false", "commit.gpgsign")
-		if err != nil {
-			return err
-		}
-	}
-	if scope == "--worktree" && localPolicy != "" {
-		if _, err := Run(ctx, dstDir, "config", scope, "commit.gpgsign", localPolicy); err != nil {
+	if scope == "--worktree" && policy != "" {
+		if _, err := Run(ctx, dstDir, "config", scope, "commit.gpgsign", policy); err != nil {
 			return err
 		}
 	}
@@ -688,10 +681,23 @@ func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
 	return nil
 }
 
+func explicitRepositoryCommitSigningPolicy(ctx context.Context, dir string) (string, error) {
+	policy, err := Run(ctx, dir, "config", "--worktree", "--bool", "--get", "--default", "", "commit.gpgsign")
+	if err != nil {
+		if !WorktreeConfigUnavailable(err) {
+			return "", err
+		}
+	} else if policy != "" {
+		return policy, nil
+	}
+	return Run(ctx, dir, "config", "--local", "--bool", "--get", "--default", "", "commit.gpgsign")
+}
+
 const commitSigningPolicySnapshotPath = "no-mistakes/commit-signing-policy"
 
 // CommitSigningPolicySnapshot returns the run-owned signing policy captured
-// for dir, or ok=false when dir predates policy snapshots.
+// for dir. An empty policy with ok=true records an explicitly unset policy;
+// ok=false means dir predates policy snapshots.
 func CommitSigningPolicySnapshot(ctx context.Context, dir string) (policy string, ok bool, err error) {
 	path, err := commitSigningPolicyPath(ctx, dir)
 	if err != nil {
@@ -705,6 +711,9 @@ func CommitSigningPolicySnapshot(ctx context.Context, dir string) (policy string
 		return "", false, err
 	}
 	policy = strings.TrimSpace(string(data))
+	if policy == "unset" {
+		return "", true, nil
+	}
 	if policy != "true" && policy != "false" {
 		return "", false, fmt.Errorf("invalid commit signing policy snapshot")
 	}
@@ -718,6 +727,9 @@ func writeCommitSigningPolicySnapshot(ctx context.Context, dir, policy string) e
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
+	}
+	if policy == "" {
+		policy = "unset"
 	}
 	return writeGateFileAtomic(path, []byte(policy+"\n"), 0o644, ".commit-signing-policy-*")
 }
