@@ -55,6 +55,8 @@ func handleFakeCLI(mode string) {
 		fakeGitRequireNonInteractiveEnvHandler(args)
 	case "git-status-error":
 		fakeGitStatusErrorHandler(args)
+	case "git-worktree-config-unsupported":
+		fakeGitWorktreeConfigUnsupportedHandler(args)
 	case "git-remote-error":
 		fakeGitRemoteErrorHandler(args)
 	case "ci-gh":
@@ -163,6 +165,14 @@ func fakeGitStatusErrorHandler(args []string) {
 		os.Exit(1)
 	}
 	fakeGitForward(args, realGit)
+}
+
+func fakeGitWorktreeConfigUnsupportedHandler(args []string) {
+	if len(args) >= 2 && args[0] == "config" && args[1] == "--worktree" {
+		fmt.Fprintln(os.Stderr, "error: unknown option `worktree'")
+		os.Exit(129)
+	}
+	fakeGitForward(args, os.Getenv("FAKE_CLI_REAL_GIT"))
 }
 
 func fakeGitPassthroughHandler(args []string) {

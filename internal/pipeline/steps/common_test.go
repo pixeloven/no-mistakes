@@ -667,6 +667,44 @@ func TestCommitAgentFixes_HonorsExplicitLocalUnsignedPolicy(t *testing.T) {
 	}
 }
 
+func TestCommitStepCorrection_FallsBackWhenWorktreeConfigUnsupported(t *testing.T) {
+	t.Parallel()
+	dir, _, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "config", "commit.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(dir, "old-git-fix.txt"), []byte("fixed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "old-git-fix.txt")
+
+	binDir := fakeCLIBinDir(t)
+	linkTestBinary(t, binDir, "git")
+	sctx := &pipeline.StepContext{
+		Ctx:     context.Background(),
+		WorkDir: dir,
+		Env: fakeCLIEnv(binDir, map[string]string{
+			"FAKE_CLI_MODE":      "git-worktree-config-unsupported",
+			"FAKE_CLI_REAL_GIT":  testGitExecutable,
+			"GIT_CONFIG_COUNT":   "3",
+			"GIT_CONFIG_KEY_0":   "commit.gpgsign",
+			"GIT_CONFIG_VALUE_0": "true",
+			"GIT_CONFIG_KEY_1":   "gpg.program",
+			"GIT_CONFIG_VALUE_1": filepath.Join(t.TempDir(), "missing-signer"),
+			"GIT_CONFIG_KEY_2":   "user.signingkey",
+			"GIT_CONFIG_VALUE_2": "unavailable-key",
+		}),
+	}
+	if err := commitStepCorrection(sctx, "old Git correction", true); err != nil {
+		t.Fatalf("commitStepCorrection: %v", err)
+	}
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got == headSHA {
+		t.Fatal("correction commit did not advance HEAD")
+	}
+	commit := gitCmd(t, dir, "cat-file", "commit", "HEAD")
+	if strings.Contains(commit, "\ngpgsig ") || strings.HasPrefix(commit, "gpgsig ") {
+		t.Fatalf("correction commit unexpectedly contains a signature:\n%s", commit)
+	}
+}
+
 func TestCommitAgentFixes_BypassesMissingLegacyHuskyRuntime(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, _ := setupGitRepo(t)

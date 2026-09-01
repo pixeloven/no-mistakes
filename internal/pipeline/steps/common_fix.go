@@ -155,7 +155,7 @@ func commitPipelineCorrection(ctx context.Context, workDir, message string, logf
 }
 
 func commitStepCorrection(sctx *pipeline.StepContext, message string, hookFree bool) error {
-	policy, err := stepGitRun(sctx, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
+	policy, err := stepCommitSigningPolicy(sctx)
 	if err != nil {
 		return err
 	}
@@ -176,6 +176,14 @@ func commitStepCorrection(sctx *pipeline.StepContext, message string, hookFree b
 	args = append(args, "-c", "core.hooksPath="+hooksDir, "commit", "--no-verify", "-m", message)
 	_, err = stepGitRun(sctx, args...)
 	return err
+}
+
+func stepCommitSigningPolicy(sctx *pipeline.StepContext) (string, error) {
+	policy, err := stepGitRun(sctx, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
+	if err == nil || !git.WorktreeConfigUnavailable(err) {
+		return policy, err
+	}
+	return stepGitRun(sctx, "config", "--local", "--get", "--default", "", "commit.gpgsign")
 }
 
 func commitPipelineCorrectionWithCleanup(

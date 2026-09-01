@@ -590,7 +590,15 @@ func CommitAll(ctx context.Context, dir, message string) error {
 // commit.gpgsign value. An empty result means the repository has not opted in
 // or out; callers must then leave normal Git configuration precedence intact.
 func LocalCommitSigningPolicy(ctx context.Context, dir string) (string, error) {
-	return Run(ctx, dir, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
+	return localCommitSigningPolicyFromEnv(ctx, dir, nil)
+}
+
+func localCommitSigningPolicyFromEnv(ctx context.Context, dir string, env []string) (string, error) {
+	policy, err := RunWithEnv(ctx, dir, env, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
+	if err == nil || !WorktreeConfigUnavailable(err) {
+		return policy, err
+	}
+	return RunWithEnv(ctx, dir, env, "config", "--local", "--get", "--default", "", "commit.gpgsign")
 }
 
 // CommitWithLocalSigningPolicy creates a commit while preserving the invoking
@@ -607,7 +615,7 @@ func CommitWithLocalSigningPolicy(ctx context.Context, dir, message, hookPath st
 // CommitWithLocalSigningPolicyFromEnv is CommitWithLocalSigningPolicy with an
 // explicit subprocess environment (used by step-scoped PATH/credentials).
 func CommitWithLocalSigningPolicyFromEnv(ctx context.Context, dir string, env []string, message, hookPath string) error {
-	policyOut, err := RunWithEnv(ctx, dir, env, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
+	policyOut, err := localCommitSigningPolicyFromEnv(ctx, dir, env)
 	if err != nil {
 		return err
 	}
@@ -652,7 +660,7 @@ func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
 			continue
 		}
 		if _, err := Run(ctx, dstDir, "config", "--worktree", key, value); err != nil {
-			if !isWorktreeConfigWriteUnavailable(err) {
+			if !WorktreeConfigUnavailable(err) {
 				return err
 			}
 			// Per-worktree config is not usable here (Git too old for the
@@ -668,14 +676,14 @@ func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
 	return nil
 }
 
-// isWorktreeConfigWriteUnavailable reports whether a `git config --worktree`
-// write failed because per-worktree config cannot be used on this repo: either
+// WorktreeConfigUnavailable reports whether `git config --worktree` cannot be
+// used on this repo: either
 // the installed Git is too old for the flag (isWorktreeConfigUnsupported), or
 // the repo has more than one worktree without extensions.worktreeConfig enabled
 // ("--worktree cannot be used with multiple working trees unless the config
 // extension worktreeConfig is enabled"). Both mean the caller should fall back
 // to the shared --local config.
-func isWorktreeConfigWriteUnavailable(err error) bool {
+func WorktreeConfigUnavailable(err error) bool {
 	if isWorktreeConfigUnsupported(err) {
 		return true
 	}
