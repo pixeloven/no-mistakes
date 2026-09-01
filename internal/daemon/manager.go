@@ -162,9 +162,14 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if err := git.RequireWorktreeCommitSettings(ctx, workDir); err != nil {
 		return nil, err
 	}
-	if err := git.RequireCommitIdentitySnapshot(ctx, workDir); err != nil {
-		return nil, fmt.Errorf("recover commit identity: %w", err)
+	if run.CommitPolicyJSON == nil {
+		return nil, fmt.Errorf("commit policy is missing; the legacy run cannot be safely recovered")
 	}
+	commitPolicy, err := git.DecodeCommitPolicy(*run.CommitPolicyJSON)
+	if err != nil {
+		return nil, fmt.Errorf("recover commit policy: %w", err)
+	}
+	policyCtx := git.WithCommitPolicy(ctx, commitPolicy)
 
 	execSteps := m.steps()
 	if err := pipeline.ValidateRecoveredRun(m.db, run, execSteps); err != nil {
@@ -178,7 +183,7 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if err != nil {
 		return nil, fmt.Errorf("resolve forge profile: %w", err)
 	}
-	agentEnvironment, err := git.CommitPolicyOverlay(ctx, workDir, forgeEnvironment(forgeCtx))
+	agentEnvironment, err := git.CommitPolicyOverlay(policyCtx, workDir, forgeEnvironment(forgeCtx))
 	if err != nil {
 		return nil, fmt.Errorf("configure agent commit policy: %w", err)
 	}
@@ -972,11 +977,23 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		}
 	}()
 
-	if err := git.CopyLocalCommitSettings(ctx, repo.WorkingPath, wtDir); err != nil {
+	commitPolicy, err := git.CaptureLocalCommitSettings(ctx, repo.WorkingPath, wtDir)
+	if err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure worktree git commit settings: %s", err))
 		trackStartFailure("configure_worktree_identity")
 		return "", fmt.Errorf("configure worktree git commit settings: %w", err)
 	}
+	commitPolicyJSON, err := git.EncodeCommitPolicy(commitPolicy)
+	if err != nil {
+		return "", fmt.Errorf("encode worktree git commit settings: %w", err)
+	}
+	if err := m.db.SetRunCommitPolicy(run.ID, commitPolicyJSON); err != nil {
+		m.db.UpdateRunError(run.ID, fmt.Sprintf("record worktree git commit settings: %s", err))
+		trackStartFailure("record_worktree_commit_policy")
+		return "", fmt.Errorf("record worktree git commit settings: %w", err)
+	}
+	run.CommitPolicyJSON = &commitPolicyJSON
+	policyCtx := git.WithCommitPolicy(ctx, commitPolicy)
 	// Fetch the trusted default branch and resolve it to an exact commit SHA
 	// before any read. Reading the trusted config at this pinned SHA (rather
 	// than the origin/<defaultBranch> remote-tracking ref) is what makes a
@@ -1056,7 +1073,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		trackStartFailure("resolve_forge_profile")
 		return "", fmt.Errorf("resolve forge profile: %w", err)
 	}
-	agentEnvironment, err := git.CommitPolicyOverlay(ctx, wtDir, forgeEnvironment(forgeCtx))
+	agentEnvironment, err := git.CommitPolicyOverlay(policyCtx, wtDir, forgeEnvironment(forgeCtx))
 	if err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure agent commit policy: %s", err))
 		trackStartFailure("configure_agent_commit_policy")

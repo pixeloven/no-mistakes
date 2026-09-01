@@ -135,7 +135,7 @@ func setupGitRepo(t *testing.T) (string, string, string) {
 		t.Fatalf("copy template repo: %v", err)
 	}
 	if err := git.CopyLocalCommitSettings(context.Background(), dir, dir); err != nil {
-		t.Fatalf("initialize commit policy snapshots: %v", err)
+		t.Fatalf("initialize commit policy: %v", err)
 	}
 
 	return dir, gitRepoTemplate.baseSHA, gitRepoTemplate.headSHA
@@ -144,6 +144,11 @@ func setupGitRepo(t *testing.T) (string, string, string) {
 // newTestContext creates a StepContext for testing with optional config overrides.
 func newTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA string, cmds config.Commands) *pipeline.StepContext {
 	t.Helper()
+	policy, err := git.CaptureLocalCommitSettings(context.Background(), workDir, workDir)
+	if err != nil {
+		t.Fatalf("capture test commit policy: %v", err)
+	}
+	policyCtx := git.WithCommitPolicy(context.Background(), policy)
 
 	// Most step tests do not exercise remote transport. Give repositories that
 	// lack an explicitly configured origin a local one so incidental upstream
@@ -168,7 +173,7 @@ func newTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA stri
 	t.Cleanup(func() { database.Close() })
 
 	return &pipeline.StepContext{
-		Ctx:  context.Background(),
+		Ctx:  policyCtx,
 		Run:  &db.Run{ID: "run-1", RepoID: "repo-1", Branch: "refs/heads/feature", HeadSHA: headSHA, BaseSHA: baseSHA},
 		Repo: &db.Repo{ID: "repo-1", WorkingPath: workDir, UpstreamURL: "https://github.com/test/repo", DefaultBranch: "main"},
 		// The executor resolves this from the app root in production. Tests get

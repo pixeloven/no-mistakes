@@ -34,6 +34,26 @@ func TestRunInsertAndGet(t *testing.T) {
 	}
 }
 
+func TestRunCommitPolicyPersistsOutsideWorktree(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/home/user/policy-project", "git@github.com:user/policy-project.git", "main")
+	run, err := d.InsertRun(repo.ID, "feature", "abc123", "def456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"name":{"present":true,"value":"Original Name"},"email":{"present":true,"value":"original@example.com"},"signing":"false"}`
+	if err := d.SetRunCommitPolicy(run.ID, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CommitPolicyJSON == nil || *got.CommitPolicyJSON != want {
+		t.Fatalf("commit policy = %v, want %q", got.CommitPolicyJSON, want)
+	}
+}
+
 func TestRunInsertAndUpdatePreserveBuildIdentity(t *testing.T) {
 	d := openTestDB(t)
 	repo, err := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")

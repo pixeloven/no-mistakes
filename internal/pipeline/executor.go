@@ -182,6 +182,14 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 // the cause message is preserved as the run's error in the DB.
 func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, workDir string) error {
 	e.workDir = workDir
+	if run.CommitPolicyJSON == nil {
+		return e.failRun(run, repo, fmt.Errorf("commit policy is missing"))
+	}
+	commitPolicy, err := git.DecodeCommitPolicy(*run.CommitPolicyJSON)
+	if err != nil {
+		return e.failRun(run, repo, err)
+	}
+	ctx = git.WithCommitPolicy(ctx, commitPolicy)
 	ctx = e.runContext(ctx)
 	// Mark run as running. Route write failures through failRun so the
 	// in-memory lifecycle and subscriber stream still become terminal instead

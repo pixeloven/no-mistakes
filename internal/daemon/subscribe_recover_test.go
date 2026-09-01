@@ -525,9 +525,18 @@ func TestRecoverOnStartup_ResumesParkedRun(t *testing.T) {
 	if err := gitpkg.WorktreeAdd(ctx, p.RepoDir(repo.ID), worktree, headSHA); err != nil {
 		t.Fatal(err)
 	}
-	if err := gitpkg.CopyLocalCommitSettings(ctx, repo.WorkingPath, worktree); err != nil {
+	policy, err := gitpkg.CaptureLocalCommitSettings(ctx, repo.WorkingPath, worktree)
+	if err != nil {
 		t.Fatal(err)
 	}
+	policyJSON, err := gitpkg.EncodeCommitPolicy(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetRunCommitPolicy(run.ID, policyJSON); err != nil {
+		t.Fatal(err)
+	}
+	run.CommitPolicyJSON = &policyJSON
 	step, err := d.InsertStepResult(run.ID, types.StepReview)
 	if err != nil {
 		t.Fatal(err)
@@ -632,7 +641,7 @@ func TestRecoverOnStartup_ResumesParkedRun(t *testing.T) {
 	}
 }
 
-func TestPrepareRecoveredRun_RejectsLegacyIdentityWithoutSnapshot(t *testing.T) {
+func TestPrepareRecoveredRun_RejectsLegacyRunWithoutCommitPolicy(t *testing.T) {
 	p := paths.WithRoot(t.TempDir())
 	if err := p.EnsureDirs(); err != nil {
 		t.Fatal(err)
@@ -668,7 +677,7 @@ func TestPrepareRecoveredRun_RejectsLegacyIdentityWithoutSnapshot(t *testing.T) 
 	}
 
 	_, err = NewRunManager(d, p, nil).prepareRecoveredRun(ctx, stored)
-	if err == nil || !strings.Contains(err.Error(), "identity snapshot is missing") {
+	if err == nil || !strings.Contains(err.Error(), "commit policy is missing") {
 		t.Fatalf("legacy recovery error = %v", err)
 	}
 }

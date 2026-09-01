@@ -83,6 +83,11 @@ func setupTest(t *testing.T) (*db.DB, *paths.Paths, *db.Run, *db.Repo) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	policyJSON := `{"name":{"present":false,"value":""},"email":{"present":false,"value":""},"signing":""}`
+	if err := database.SetRunCommitPolicy(run.ID, policyJSON); err != nil {
+		t.Fatal(err)
+	}
+	run.CommitPolicyJSON = &policyJSON
 	return database, p, run, repo
 }
 
