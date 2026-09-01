@@ -48,6 +48,17 @@ func TestOpenBrowserCmd_WaitsForBrowserCommand(t *testing.T) {
 	}
 }
 
+func TestWorktreeForRunOmitsCrossBranchAttachment(t *testing.T) {
+	run := testRun()
+	run.Branch = "feature"
+	if got := worktreeForRun("/work/main", "main", run); got != "" {
+		t.Fatalf("cross-branch worktree = %q, want empty", got)
+	}
+	if got := worktreeForRun("/work/feature", "feature", run); got != "/work/feature" {
+		t.Fatalf("matching worktree = %q, want /work/feature", got)
+	}
+}
+
 func TestOpenBrowserCmd_ReturnsErrMsgOnFailure(t *testing.T) {
 	original := runBrowserCommand
 	t.Cleanup(func() {
@@ -137,7 +148,7 @@ func TestModel_Update_RerunKeyStartsNewRunAndSwitchesModel(t *testing.T) {
 		if err := json.Unmarshal(raw, &params); err != nil {
 			return nil, err
 		}
-		if params.RepoID != "repo-001" || params.Branch != "feature/foo" || params.PreviousRunID != "run-001" {
+		if params.RepoID != "repo-001" || params.Branch != "feature/foo" || params.PreviousRunID != "run-001" || params.Worktree != "/work/feature" {
 			return nil, fmt.Errorf("unexpected rerun params: %#v", params)
 		}
 		return &ipc.RerunResult{RunID: newRun.ID}, nil
@@ -173,6 +184,7 @@ func TestModel_Update_RerunKeyStartsNewRunAndSwitchesModel(t *testing.T) {
 	run.Status = types.RunFailed
 	run.Error = ptr("push failed")
 	m := NewModel(sock, client, run)
+	m.worktree = "/work/feature"
 	m.width = 80
 	m.height = 24
 	m.err = errors.New("old error")
@@ -206,6 +218,9 @@ func TestModel_Update_RerunKeyStartsNewRunAndSwitchesModel(t *testing.T) {
 	}
 	if len(model.logs) != 0 {
 		t.Fatalf("expected rerun to clear logs, got %v", model.logs)
+	}
+	if model.worktree != "/work/feature" {
+		t.Fatalf("worktree = %q, want preserved provenance", model.worktree)
 	}
 	if nextCmd == nil {
 		t.Fatal("expected subscribe command after rerun")

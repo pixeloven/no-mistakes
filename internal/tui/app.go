@@ -466,12 +466,14 @@ func (m *Model) resetForRun(run *ipc.RunInfo) {
 	width, height := m.width, m.height
 	nextSubscriptionID := m.subscriptionID + 1
 	latestVersion := m.latestVersion
+	worktree := m.worktree
 	fresh := NewModel(m.socketPath, m.client, run)
 	fresh.width = width
 	fresh.height = height
 	fresh.subscriptionID = nextSubscriptionID
 	fresh.rerunRequestID = m.rerunRequestID
 	fresh.latestVersion = latestVersion
+	fresh.worktree = worktree
 	*m = fresh
 }
 
@@ -494,7 +496,7 @@ func (m *Model) refreshCachedSync() {
 func Run(socketPath string, client *ipc.Client, run *ipc.RunInfo, latestVersion string) error {
 	model := NewModel(socketPath, client, run)
 	model.latestVersion = latestVersion
-	model.worktree, _ = git.FindGitRoot(".")
+	model.worktree = currentWorktreeForRun(context.Background(), run)
 	if service, closeFn, err := branchsync.OpenCurrent(); err == nil {
 		defer closeFn()
 		model.syncService = service
@@ -506,6 +508,28 @@ func Run(socketPath string, client *ipc.Client, run *ipc.RunInfo, latestVersion 
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
+}
+
+func currentWorktreeForRun(ctx context.Context, run *ipc.RunInfo) string {
+	if run == nil {
+		return ""
+	}
+	root, err := git.FindGitRoot(".")
+	if err != nil {
+		return ""
+	}
+	branch, err := git.CurrentBranch(ctx, root)
+	if err != nil {
+		return ""
+	}
+	return worktreeForRun(root, branch, run)
+}
+
+func worktreeForRun(root, branch string, run *ipc.RunInfo) string {
+	if run == nil || branch != run.Branch {
+		return ""
+	}
+	return root
 }
 
 func tuiRelevantSyncState(state branchsync.State) bool {

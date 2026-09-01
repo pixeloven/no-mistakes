@@ -725,7 +725,7 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 	}
 
 	branch := branchFromRef(params.Ref)
-	policySource, err := resolveCommitPolicySource(ctx, repo, params.Worktree, branch, params.New)
+	policySource, err := resolveCommitPolicySource(ctx, repo, params.Worktree, branch, params.New, false)
 	if err != nil {
 		return "", err
 	}
@@ -811,14 +811,14 @@ func (m *RunManager) handleRerunFromWorktree(ctx context.Context, repoID, branch
 		}
 	}
 
-	policySource, err := resolveCommitPolicySource(ctx, repo, sourceWorktree, branch, headSHA)
+	policySource, err := resolveCommitPolicySource(ctx, repo, sourceWorktree, branch, headSHA, true)
 	if err != nil {
 		return "", err
 	}
 	return m.startRunWithIntentSourceAndPolicy(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, policySource)
 }
 
-func resolveCommitPolicySource(ctx context.Context, repo *db.Repo, supplied, branch, headSHA string) (string, error) {
+func resolveCommitPolicySource(ctx context.Context, repo *db.Repo, supplied, branch, headSHA string, requireBranch bool) (string, error) {
 	validate := func(candidate string) (string, error) {
 		root, err := git.FindGitRoot(candidate)
 		if err != nil {
@@ -835,7 +835,28 @@ func resolveCommitPolicySource(ctx context.Context, repo *db.Repo, supplied, bra
 	}
 
 	if strings.TrimSpace(supplied) != "" {
-		return validate(supplied)
+		root, err := validate(supplied)
+		if err != nil {
+			return "", err
+		}
+		if requireBranch {
+			candidateBranch, err := git.CurrentBranch(ctx, root)
+			if err != nil {
+				return "", fmt.Errorf("resolve initiating worktree branch: %w", err)
+			}
+			if candidateBranch != branch {
+				return "", fmt.Errorf("initiating worktree branch %s does not match run branch %s", candidateBranch, branch)
+			}
+		} else {
+			candidateHead, err := git.HeadSHA(ctx, root)
+			if err != nil {
+				return "", fmt.Errorf("resolve initiating worktree head: %w", err)
+			}
+			if candidateHead != headSHA {
+				return "", fmt.Errorf("initiating worktree head %s does not match pushed head %s", candidateHead, headSHA)
+			}
+		}
+		return root, nil
 	}
 
 	out, err := git.Run(ctx, repo.WorkingPath, "worktree", "list", "--porcelain", "-z")
@@ -878,7 +899,29 @@ func resolveCommitPolicySource(ctx context.Context, repo *db.Repo, supplied, bra
 	if len(matches) == 1 {
 		return validate(matches[0])
 	}
-	if len(entries) == 1 {
+	if !requireBranch {
+		matches = matches[:0]
+		for _, entry := range entries {
+			if entry.head == headSHA {
+				matches = append(matches, entry.path)
+			}
+		}
+		if len(matches) == 1 {
+			return validate(matches[0])
+		}
+	}
+	if requireBranch {
+		matches = matches[:0]
+		for _, entry := range entries {
+			if entry.branch == branch {
+				matches = append(matches, entry.path)
+			}
+		}
+		if len(matches) == 1 {
+			return validate(matches[0])
+		}
+	}
+	if !requireBranch && len(entries) == 1 {
 		return validate(entries[0].path)
 	}
 	return "", fmt.Errorf("cannot identify the initiating worktree for branch %s at %s; retry from that worktree with no-mistakes axi run or no-mistakes rerun", branch, headSHA)

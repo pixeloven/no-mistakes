@@ -38,9 +38,14 @@ func TestResolveCommitPolicySourceUsesMatchingLinkedWorktree(t *testing.T) {
 	gitCmd(t, mainWorktree, "add", "file.txt")
 	gitCmd(t, mainWorktree, "commit", "-m", "initial")
 	gitCmd(t, mainWorktree, "worktree", "add", "-b", "feature", linkedWorktree)
+	if err := os.WriteFile(filepath.Join(linkedWorktree, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, linkedWorktree, "add", "feature.txt")
+	gitCmd(t, linkedWorktree, "commit", "-m", "feature")
 	headSHA := gitOutput(t, linkedWorktree, "rev-parse", "HEAD")
 
-	got, err := resolveCommitPolicySource(context.Background(), &db.Repo{WorkingPath: mainWorktree}, "", "feature", headSHA)
+	got, err := resolveCommitPolicySource(context.Background(), &db.Repo{WorkingPath: mainWorktree}, "", "feature", headSHA, false)
 	if err != nil {
 		t.Fatalf("resolveCommitPolicySource: %v", err)
 	}
@@ -50,6 +55,18 @@ func TestResolveCommitPolicySourceUsesMatchingLinkedWorktree(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("policy source = %q, want linked worktree %q", got, want)
+	}
+
+	renamed, err := resolveCommitPolicySource(context.Background(), &db.Repo{WorkingPath: mainWorktree}, "", "review-feature", headSHA, false)
+	if err != nil {
+		t.Fatalf("resolve renamed push policy source: %v", err)
+	}
+	if renamed != want {
+		t.Fatalf("renamed push policy source = %q, want %q", renamed, want)
+	}
+
+	if _, err := resolveCommitPolicySource(context.Background(), &db.Repo{WorkingPath: mainWorktree}, mainWorktree, "feature", headSHA, true); err == nil || !strings.Contains(err.Error(), "does not match run branch") {
+		t.Fatalf("cross-branch supplied worktree error = %v", err)
 	}
 }
 
