@@ -221,39 +221,42 @@ func TestCopyLocalCommitSettings_ExplicitUnsignedPolicySurvivesFailingSigner(t *
 	}
 }
 
-func TestCopyLocalCommitSettings_FallbackClearsRemovedSigningPolicy(t *testing.T) {
+func TestCopyLocalCommitSettings_FallbackSnapshotsConcurrentSigningPolicies(t *testing.T) {
 	ctx := context.Background()
 	src := initTestRepo(t)
 	dst := initTestRepo(t)
-	linked := filepath.Join(t.TempDir(), "linked")
-	run(t, dst, "git", "worktree", "add", "--detach", linked, "HEAD")
-	run(t, src, "git", "config", "commit.gpgsign", "false")
+	linkedA := filepath.Join(t.TempDir(), "linked-a")
+	linkedB := filepath.Join(t.TempDir(), "linked-b")
+	run(t, dst, "git", "worktree", "add", "--detach", linkedA, "HEAD")
+	run(t, dst, "git", "worktree", "add", "--detach", linkedB, "HEAD")
+	run(t, src, "git", "config", "extensions.worktreeConfig", "true")
+	run(t, src, "git", "config", "--worktree", "commit.gpgsign", "true")
+	run(t, src, "git", "config", "--local", "commit.gpgsign", "false")
 
-	if err := CopyLocalCommitSettings(ctx, src, linked); err != nil {
-		t.Fatalf("initial CopyLocalCommitSettings: %v", err)
+	if err := CopyLocalCommitSettings(ctx, src, linkedA); err != nil {
+		t.Fatalf("CopyLocalCommitSettings run A: %v", err)
 	}
 	run(t, src, "git", "config", "--unset-all", "commit.gpgsign")
-	if err := CopyLocalCommitSettings(ctx, src, linked); err != nil {
-		t.Fatalf("updated CopyLocalCommitSettings: %v", err)
+	if err := CopyLocalCommitSettings(ctx, src, linkedB); err != nil {
+		t.Fatalf("CopyLocalCommitSettings run B: %v", err)
 	}
 
-	writeFile(t, filepath.Join(linked, "generated-fix.txt"), "generated review fix\n")
-	run(t, linked, "git", "add", "generated-fix.txt")
-	before := run(t, linked, "git", "rev-parse", "HEAD")
-	env := []string{
-		"GIT_CONFIG_COUNT=3",
-		"GIT_CONFIG_KEY_0=commit.gpgsign",
-		"GIT_CONFIG_VALUE_0=true",
-		"GIT_CONFIG_KEY_1=gpg.program",
-		"GIT_CONFIG_VALUE_1=" + filepath.Join(t.TempDir(), "missing-signer"),
-		"GIT_CONFIG_KEY_2=user.signingkey",
-		"GIT_CONFIG_VALUE_2=test-signing-key",
+	missingSigner := filepath.Join(t.TempDir(), "missing-signer")
+	for _, linked := range []string{linkedA, linkedB} {
+		run(t, linked, "git", "config", "gpg.program", missingSigner)
+		run(t, linked, "git", "config", "user.signingkey", "test-signing-key")
+		writeFile(t, filepath.Join(linked, "generated-fix.txt"), "generated review fix\n")
+		run(t, linked, "git", "add", "generated-fix.txt")
 	}
-	if err := CommitWithLocalSigningPolicyFromEnv(ctx, linked, env, "pipeline review fix", ""); err == nil {
-		t.Fatal("commit unexpectedly ignored ambient signing after source policy removal")
+	if err := CommitWithLocalSigningPolicy(ctx, linkedA, "pipeline review fix A", ""); err != nil {
+		t.Fatalf("run A correction did not retain unsigned policy: %v", err)
 	}
-	if got := run(t, linked, "git", "rev-parse", "HEAD"); got != before {
-		t.Fatalf("failed signed commit moved HEAD to %s, want %s", got, before)
+	beforeB := run(t, linkedB, "git", "rev-parse", "HEAD")
+	if err := CommitWithLocalSigningPolicy(ctx, linkedB, "pipeline review fix B", ""); err == nil {
+		t.Fatal("run B correction ignored captured signed policy")
+	}
+	if got := run(t, linkedB, "git", "rev-parse", "HEAD"); got != beforeB {
+		t.Fatalf("failed signed commit moved run B HEAD to %s, want %s", got, beforeB)
 	}
 }
 

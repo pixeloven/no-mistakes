@@ -179,6 +179,9 @@ func commitStepCorrection(sctx *pipeline.StepContext, message string, hookFree b
 }
 
 func stepCommitSigningPolicy(sctx *pipeline.StepContext) (string, error) {
+	if policy, ok, err := git.CommitSigningPolicySnapshot(sctx.Ctx, sctx.WorkDir); err != nil || ok {
+		return policy, err
+	}
 	policy, err := stepGitRun(sctx, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
 	if err == nil || !git.WorktreeConfigUnavailable(err) {
 		return policy, err

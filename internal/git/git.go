@@ -586,14 +586,16 @@ func CommitAll(ctx context.Context, dir, message string) error {
 	return err
 }
 
-// LocalCommitSigningPolicy returns the explicitly configured worktree-local
-// commit.gpgsign value. An empty result means the repository has not opted in
-// or out; callers must then leave normal Git configuration precedence intact.
+// LocalCommitSigningPolicy returns the run-captured commit signing policy,
+// falling back to worktree-local configuration for legacy callers.
 func LocalCommitSigningPolicy(ctx context.Context, dir string) (string, error) {
 	return localCommitSigningPolicyFromEnv(ctx, dir, nil)
 }
 
 func localCommitSigningPolicyFromEnv(ctx context.Context, dir string, env []string) (string, error) {
+	if policy, ok, err := CommitSigningPolicySnapshot(ctx, dir); err != nil || ok {
+		return policy, err
+	}
 	policy, err := RunWithEnv(ctx, dir, env, "config", "--worktree", "--get", "--default", "", "commit.gpgsign")
 	if err == nil || !WorktreeConfigUnavailable(err) {
 		return policy, err
@@ -635,11 +637,8 @@ func CommitWithLocalSigningPolicyFromEnv(ctx context.Context, dir string, env []
 	return err
 }
 
-// CopyLocalCommitSettings copies repository-local commit settings from srcDir
-// into dstDir. It carries user.name, user.email, and an explicitly configured
-// commit.gpgsign value. Missing values in srcDir are removed from the selected
-// destination scope so ordinary Git configuration precedence remains
-// authoritative.
+// CopyLocalCommitSettings copies repository-local identity from srcDir into
+// dstDir and captures the run's commit signing policy.
 //
 // The write into dstDir uses per-worktree scope (`git config --worktree`) when
 // the repository has worktree config enabled. dstDir is typically a linked
@@ -655,22 +654,83 @@ func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
 	if err != nil {
 		return err
 	}
-	for _, key := range []string{"user.name", "user.email", "commit.gpgsign"} {
+	for _, key := range []string{"user.name", "user.email"} {
 		value, err := Run(ctx, srcDir, "config", "--local", "--get", "--default", "", key)
 		if err != nil {
 			return err
 		}
 		if value == "" {
-			if _, err := Run(ctx, dstDir, "config", scope, "--unset-all", key); err != nil && !isConfigKeyMissing(err) {
-				return err
-			}
 			continue
 		}
 		if _, err := Run(ctx, dstDir, "config", scope, key, value); err != nil {
 			return err
 		}
 	}
+	localPolicy, err := Run(ctx, srcDir, "config", "--local", "--bool", "--get", "--default", "", "commit.gpgsign")
+	if err != nil {
+		return err
+	}
+	policy := localPolicy
+	if policy == "" {
+		policy, err = Run(ctx, srcDir, "config", "--bool", "--get", "--default", "false", "commit.gpgsign")
+		if err != nil {
+			return err
+		}
+	}
+	if scope == "--worktree" && localPolicy != "" {
+		if _, err := Run(ctx, dstDir, "config", scope, "commit.gpgsign", localPolicy); err != nil {
+			return err
+		}
+	}
+	if err := writeCommitSigningPolicySnapshot(ctx, dstDir, policy); err != nil {
+		return err
+	}
 	return nil
+}
+
+const commitSigningPolicySnapshotPath = "no-mistakes/commit-signing-policy"
+
+// CommitSigningPolicySnapshot returns the run-owned signing policy captured
+// for dir, or ok=false when dir predates policy snapshots.
+func CommitSigningPolicySnapshot(ctx context.Context, dir string) (policy string, ok bool, err error) {
+	path, err := commitSigningPolicyPath(ctx, dir)
+	if err != nil {
+		return "", false, err
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	policy = strings.TrimSpace(string(data))
+	if policy != "true" && policy != "false" {
+		return "", false, fmt.Errorf("invalid commit signing policy snapshot")
+	}
+	return policy, true, nil
+}
+
+func writeCommitSigningPolicySnapshot(ctx context.Context, dir, policy string) error {
+	path, err := commitSigningPolicyPath(ctx, dir)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return writeGateFileAtomic(path, []byte(policy+"\n"), 0o644, ".commit-signing-policy-*")
+}
+
+func commitSigningPolicyPath(ctx context.Context, dir string) (string, error) {
+	path, err := Run(ctx, dir, "rev-parse", "--git-path", commitSigningPolicySnapshotPath)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(dir, path)
+	}
+	return filepath.Clean(path), nil
 }
 
 func localCommitSettingsScope(ctx context.Context, dir string) (string, error) {
