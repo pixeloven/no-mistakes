@@ -3,11 +3,14 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	gitutil "github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -124,7 +127,12 @@ func TestExecutor_AwaitingAgentMarkerSetOnGateClearedOnRespond(t *testing.T) {
 }
 
 func TestExecutor_ResumeRestoresParkedGateAndReviewSessions(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "0")
 	database, p, run, repo := setupTest(t)
+	policyJSON := `{"name":{"present":true,"value":"Recovered Name"},"email":{"present":true,"value":"recovered@example.com"},"signing":"false"}`
+	if err := database.SetRunCommitPolicy(run.ID, policyJSON); err != nil {
+		t.Fatal(err)
+	}
 	if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
 		t.Fatal(err)
 	}
@@ -160,11 +168,32 @@ func TestExecutor_ResumeRestoresParkedGateAndReviewSessions(t *testing.T) {
 	}
 
 	fake := newFakeSessionAgent()
+	workDir := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "extensions.worktreeConfig", "true"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = workDir
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
 	step := &adaptiveCallStep{
 		name: types.StepReview,
 		fn: func(sctx *StepContext) (*StepOutcome, error) {
 			if !sctx.Fixing {
 				return nil, fmt.Errorf("recovered gate must not rerun its completed review pass")
+			}
+			args, err := gitutil.LocalCommitPolicyArgs(sctx.Ctx, sctx.WorkDir)
+			if err != nil {
+				return nil, err
+			}
+			joined := strings.Join(args, " ")
+			for _, want := range []string{"user.name=Recovered Name", "user.email=recovered@example.com", "commit.gpgsign=false"} {
+				if !strings.Contains(joined, want) {
+					return nil, fmt.Errorf("recovered commit policy %q missing %q", joined, want)
+				}
 			}
 			if _, err := sctx.RunAgentSession(SessionRoleFixer, agent.RunOpts{Prompt: "fix"}); err != nil {
 				return nil, err
@@ -180,7 +209,7 @@ func TestExecutor_ResumeRestoresParkedGateAndReviewSessions(t *testing.T) {
 	exec := NewExecutor(database, p, &config.Config{SessionReuse: true}, fake, []Step{step}, nil)
 	done := make(chan error, 1)
 	go func() {
-		done <- exec.Resume(context.Background(), run, repo, t.TempDir())
+		done <- exec.Resume(context.Background(), run, repo, workDir)
 	}()
 
 	deadline := time.Now().Add(5 * time.Second)

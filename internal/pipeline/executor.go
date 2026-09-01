@@ -182,14 +182,10 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 // the cause message is preserved as the run's error in the DB.
 func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, workDir string) error {
 	e.workDir = workDir
-	if run.CommitPolicyJSON == nil {
-		return e.failRun(run, repo, fmt.Errorf("commit policy is missing"))
-	}
-	commitPolicy, err := git.DecodeCommitPolicy(*run.CommitPolicyJSON)
+	ctx, err := commitPolicyContext(ctx, run)
 	if err != nil {
 		return e.failRun(run, repo, err)
 	}
-	ctx = git.WithCommitPolicy(ctx, commitPolicy)
 	ctx = e.runContext(ctx)
 	// Mark run as running. Route write failures through failRun so the
 	// in-memory lifecycle and subscriber stream still become terminal instead
@@ -344,10 +340,14 @@ func ValidateRecoveredRun(database *db.DB, run *db.Run, steps []Step) error {
 // an error so startup recovery can fail the run rather than guessing.
 func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workDir string) error {
 	e.workDir = workDir
-	ctx = e.runContext(ctx)
 	if repo == nil {
 		return fmt.Errorf("recovered run has no repository")
 	}
+	ctx, err := commitPolicyContext(ctx, run)
+	if err != nil {
+		return e.failRun(run, repo, err)
+	}
+	ctx = e.runContext(ctx)
 	if err := ValidateRecoveredRun(e.db, run, e.steps); err != nil {
 		return err
 	}
@@ -532,6 +532,17 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	default:
 		return e.failRun(run, repo, fmt.Errorf("step %s: unsupported approval action %q", gate.step.Name(), response.action), ctx)
 	}
+}
+
+func commitPolicyContext(ctx context.Context, run *db.Run) (context.Context, error) {
+	if run == nil || run.CommitPolicyJSON == nil {
+		return nil, fmt.Errorf("commit policy is missing")
+	}
+	commitPolicy, err := git.DecodeCommitPolicy(*run.CommitPolicyJSON)
+	if err != nil {
+		return nil, err
+	}
+	return git.WithCommitPolicy(ctx, commitPolicy), nil
 }
 
 func (e *Executor) runContext(ctx context.Context) context.Context {
