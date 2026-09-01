@@ -667,7 +667,7 @@ func TestCommitAgentFixes_HonorsExplicitLocalUnsignedPolicy(t *testing.T) {
 	}
 }
 
-func TestCommitStepCorrection_FallsBackWhenWorktreeConfigUnsupported(t *testing.T) {
+func TestCommitStepCorrection_RejectsUnsupportedWorktreeConfig(t *testing.T) {
 	t.Parallel()
 	dir, _, headSHA := setupGitRepo(t)
 	gitCmd(t, dir, "config", "commit.gpgsign", "false")
@@ -693,15 +693,12 @@ func TestCommitStepCorrection_FallsBackWhenWorktreeConfigUnsupported(t *testing.
 			"GIT_CONFIG_VALUE_2": "unavailable-key",
 		}),
 	}
-	if err := commitStepCorrection(sctx, "old Git correction", true); err != nil {
-		t.Fatalf("commitStepCorrection: %v", err)
+	err := commitStepCorrection(sctx, "old Git correction", true)
+	if err == nil || !strings.Contains(err.Error(), "upgrade Git") || !strings.Contains(err.Error(), "worktree configuration") {
+		t.Fatalf("unsupported worktree config error = %v", err)
 	}
-	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got == headSHA {
-		t.Fatal("correction commit did not advance HEAD")
-	}
-	commit := gitCmd(t, dir, "cat-file", "commit", "HEAD")
-	if strings.Contains(commit, "\ngpgsig ") || strings.HasPrefix(commit, "gpgsig ") {
-		t.Fatalf("correction commit unexpectedly contains a signature:\n%s", commit)
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
+		t.Fatalf("rejected correction moved HEAD to %s, want %s", got, headSHA)
 	}
 }
 

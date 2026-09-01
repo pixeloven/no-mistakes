@@ -17,6 +17,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps/internal/stepstest"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -132,6 +133,9 @@ func setupGitRepo(t *testing.T) (string, string, string) {
 	dir := t.TempDir()
 	if err := copyDirContents(gitRepoTemplate.dir, dir); err != nil {
 		t.Fatalf("copy template repo: %v", err)
+	}
+	if err := git.CopyLocalCommitSettings(context.Background(), dir, dir); err != nil {
+		t.Fatalf("initialize commit policy snapshots: %v", err)
 	}
 
 	return dir, gitRepoTemplate.baseSHA, gitRepoTemplate.headSHA
