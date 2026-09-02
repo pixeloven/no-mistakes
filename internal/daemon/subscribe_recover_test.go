@@ -514,6 +514,9 @@ func TestRecoverOnStartup_ResumesParkedRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := d.SetRunCommitSigningPolicy(run.ID, "false", nil); err != nil {
+		t.Fatal(err)
+	}
 	if err := d.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
 		t.Fatal(err)
 	}
@@ -521,6 +524,7 @@ func TestRecoverOnStartup_ResumesParkedRun(t *testing.T) {
 	if err := gitpkg.WorktreeAdd(context.Background(), p.RepoDir(repo.ID), worktree, headSHA); err != nil {
 		t.Fatal(err)
 	}
+	gitCmd(t, worktree, "config", "--worktree", "commit.gpgsign", "false")
 	step, err := d.InsertStepResult(run.ID, types.StepReview)
 	if err != nil {
 		t.Fatal(err)
@@ -657,6 +661,9 @@ func TestRecoverOnStartup_ReconcilesHistoricalCIGateFromCurrentPRState(t *testin
 			if err != nil {
 				t.Fatal(err)
 			}
+			if err := d.SetRunCommitSigningPolicy(run.ID, "false", nil); err != nil {
+				t.Fatal(err)
+			}
 			if err := d.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
 				t.Fatal(err)
 			}
@@ -669,6 +676,7 @@ func TestRecoverOnStartup_ReconcilesHistoricalCIGateFromCurrentPRState(t *testin
 			if err := gitpkg.WorktreeAdd(context.Background(), p.RepoDir(repo.ID), worktree, headSHA); err != nil {
 				t.Fatal(err)
 			}
+			gitCmd(t, worktree, "config", "--worktree", "commit.gpgsign", "false")
 			step, err := d.InsertStepResult(run.ID, types.StepCI)
 			if err != nil {
 				t.Fatal(err)
