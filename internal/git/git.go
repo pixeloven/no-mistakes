@@ -590,6 +590,9 @@ func CommitAll(ctx context.Context, dir, message string) error {
 // Empty means unset and preserves ordinary Git precedence. Worktree config is
 // required so admission cannot silently read shared configuration.
 func LocalCommitSigningPolicy(ctx context.Context, dir string) (string, error) {
+	if err := requireWorktreeConfig(ctx, dir); err != nil {
+		return "", err
+	}
 	return configPolicyAtScope(ctx, dir, "--worktree")
 }
 
@@ -600,9 +603,12 @@ func ValidateRestoredCommitSigningPolicy(ctx context.Context, dir, policy string
 	if err := validateCommitSigningPolicy(policy); err != nil {
 		return err
 	}
+	if err := requireWorktreeConfig(ctx, dir); err != nil {
+		return err
+	}
 	worktree, err := configPolicyAtScope(ctx, dir, "--worktree")
 	if err != nil {
-		return fmt.Errorf("worktree-scoped Git configuration is required: %w", err)
+		return err
 	}
 	if policy != "" {
 		if worktree != policy {
@@ -619,6 +625,26 @@ func ValidateRestoredCommitSigningPolicy(ctx context.Context, dir, policy string
 	}
 	if local != "" {
 		return fmt.Errorf("unsafe stale Git configuration key commit.gpgsign")
+	}
+	return nil
+}
+
+func requireWorktreeConfig(ctx context.Context, dir string) error {
+	enabled, err := Run(ctx, dir, "config", "--local", "--bool", "--get", "extensions.worktreeConfig")
+	if err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			return fmt.Errorf("verify extensions.worktreeConfig: %w", err)
+		}
+	}
+	if enabled != "true" {
+		return fmt.Errorf("worktree-scoped Git configuration requires extensions.worktreeConfig=true; run git config extensions.worktreeConfig true in the registered checkout")
+	}
+	if _, err := Run(ctx, dir, "config", "--worktree", "--get-regexp", "^$"); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			return fmt.Errorf("worktree-scoped Git configuration requires Git support for git config --worktree: %w", err)
+		}
 	}
 	return nil
 }
@@ -684,6 +710,9 @@ func SetWorktreeCommitSigningPolicy(ctx context.Context, dir, policy string) err
 	if policy == "" {
 		return ValidateRestoredCommitSigningPolicy(ctx, dir, policy)
 	}
+	if err := requireWorktreeConfig(ctx, dir); err != nil {
+		return err
+	}
 	if err := setCommitSigningPolicyAtScope(ctx, dir, "--worktree", policy); err != nil {
 		return fmt.Errorf("worktree-scoped Git configuration is required: %w", err)
 	}
@@ -714,11 +743,10 @@ func setCommitSigningPolicyAtScope(ctx context.Context, dir, scope, policy strin
 	return err
 }
 
-// CopyLocalCommitSettings copies repository-local commit settings from srcDir
-// into dstDir. It carries user.name, user.email, and an explicitly configured
-// commit.gpgsign value. Missing values in srcDir are ignored, so ordinary Git
-// configuration precedence remains authoritative when the source repository
-// has not opted into or out of commit signing.
+// CopyLocalCommitSettings copies repository-local identity from srcDir into
+// dstDir and applies the supplied commit signing policy. Missing identity in
+// srcDir is ignored, and an unset signing policy preserves ordinary Git
+// configuration precedence.
 //
 // The write into dstDir uses per-worktree scope (`git config --worktree`) when
 // the repository has worktree config enabled. dstDir is typically a linked
@@ -728,16 +756,14 @@ func setCommitSigningPolicyAtScope(ctx context.Context, dir, scope, policy strin
 // on that single lock and one fails with "could not lock config file ...
 // config: File exists". Writing per-worktree puts each run's identity in its own
 // <bare>/worktrees/<id>/config.worktree, so concurrent startups never contend.
-// Older Git without `--worktree` support falls back to `--local`.
-func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
-	for _, key := range []string{"user.name", "user.email", "commit.gpgsign"} {
-		var value string
-		var err error
-		if key == "commit.gpgsign" {
-			value, err = LocalCommitSigningPolicy(ctx, srcDir)
-		} else {
-			value, err = Run(ctx, srcDir, "config", "--local", "--get", "--default", "", key)
-		}
+// Older Git without `--worktree` support may still use the identity fallback;
+// commit.gpgsign always requires isolated worktree configuration.
+func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir, commitPolicy string) error {
+	if err := validateCommitSigningPolicy(commitPolicy); err != nil {
+		return err
+	}
+	for _, key := range []string{"user.name", "user.email"} {
+		value, err := Run(ctx, srcDir, "config", "--local", "--get", "--default", "", key)
 		if err != nil {
 			return err
 		}
@@ -758,7 +784,7 @@ func CopyLocalCommitSettings(ctx context.Context, srcDir, dstDir string) error {
 			}
 		}
 	}
-	return nil
+	return SetWorktreeCommitSigningPolicy(ctx, dstDir, commitPolicy)
 }
 
 // isWorktreeConfigWriteUnavailable reports whether a `git config --worktree`

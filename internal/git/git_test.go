@@ -162,22 +162,22 @@ func TestCopyLocalCommitSettings(t *testing.T) {
 	ctx := context.Background()
 	src := initTestRepo(t)
 	dst := initTestRepo(t)
-	run(t, src, "git", "config", "commit.gpgsign", "false")
+	run(t, dst, "git", "config", "extensions.worktreeConfig", "true")
 
 	run(t, dst, "git", "config", "--local", "--unset", "user.name")
 	run(t, dst, "git", "config", "--local", "--unset", "user.email")
 
-	if err := CopyLocalCommitSettings(ctx, src, dst); err != nil {
+	if err := CopyLocalCommitSettings(ctx, src, dst, "false"); err != nil {
 		t.Fatalf("CopyLocalCommitSettings failed: %v", err)
 	}
 
-	if got := run(t, dst, "git", "config", "--local", "--get", "user.name"); got != "Test" {
+	if got := run(t, dst, "git", "config", "--worktree", "--get", "user.name"); got != "Test" {
 		t.Fatalf("user.name = %q, want %q", got, "Test")
 	}
-	if got := run(t, dst, "git", "config", "--local", "--get", "user.email"); got != "test@test.com" {
+	if got := run(t, dst, "git", "config", "--worktree", "--get", "user.email"); got != "test@test.com" {
 		t.Fatalf("user.email = %q, want %q", got, "test@test.com")
 	}
-	if got := run(t, dst, "git", "config", "--local", "--get", "commit.gpgsign"); got != "false" {
+	if got := run(t, dst, "git", "config", "--worktree", "--get", "commit.gpgsign"); got != "false" {
 		t.Fatalf("commit.gpgsign = %q, want false", got)
 	}
 }
@@ -186,8 +186,8 @@ func TestCopyLocalCommitSettings_ExplicitUnsignedPolicySurvivesFailingSigner(t *
 	ctx := context.Background()
 	src := initTestRepo(t)
 	dst := initTestRepo(t)
-	run(t, src, "git", "config", "commit.gpgsign", "false")
-	run(t, dst, "git", "config", "commit.gpgsign", "true")
+	run(t, dst, "git", "config", "extensions.worktreeConfig", "true")
+	run(t, dst, "git", "config", "--worktree", "commit.gpgsign", "true")
 	run(t, dst, "git", "config", "gpg.program", filepath.Join(t.TempDir(), "missing-signer"))
 	run(t, dst, "git", "config", "user.signingkey", "test-signing-key")
 
@@ -206,7 +206,7 @@ func TestCopyLocalCommitSettings_ExplicitUnsignedPolicySurvivesFailingSigner(t *
 		t.Fatalf("failed signed commit lost staged fixes: %q", got)
 	}
 
-	if err := CopyLocalCommitSettings(ctx, src, dst); err != nil {
+	if err := CopyLocalCommitSettings(ctx, src, dst, "false"); err != nil {
 		t.Fatalf("CopyLocalCommitSettings failed: %v", err)
 	}
 	if _, err := Run(ctx, dst, "commit", "-m", "pipeline review fix"); err != nil {
@@ -216,38 +216,47 @@ func TestCopyLocalCommitSettings_ExplicitUnsignedPolicySurvivesFailingSigner(t *
 	if strings.Contains(commit, "\ngpgsig ") || strings.HasPrefix(commit, "gpgsig ") {
 		t.Fatalf("explicitly unsigned pipeline commit contains a signature:\n%s", commit)
 	}
-	if got := run(t, src, "git", "config", "--local", "--get", "commit.gpgsign"); got != "false" {
-		t.Fatalf("source signing policy changed to %q", got)
+	cmd = exec.Command("git", "config", "--local", "--get", "commit.gpgsign")
+	cmd.Dir = src
+	if err := cmd.Run(); err == nil {
+		t.Fatal("source signing policy was created")
 	}
 }
 
 func TestCopyLocalCommitSettings_PreservesSignedAndDefaultBehavior(t *testing.T) {
 	tests := []struct {
-		name         string
-		sourcePolicy string
-		targetPolicy string
-		wantPolicy   string
+		name   string
+		policy string
 	}{
-		{name: "explicit signed", sourcePolicy: "true", targetPolicy: "false", wantPolicy: "true"},
-		{name: "unspecified", targetPolicy: "true", wantPolicy: "true"},
+		{name: "explicit signed", policy: "true"},
+		{name: "unspecified"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 			src := initTestRepo(t)
 			dst := initTestRepo(t)
-			if tt.sourcePolicy != "" {
-				run(t, src, "git", "config", "commit.gpgsign", tt.sourcePolicy)
+			run(t, dst, "git", "config", "extensions.worktreeConfig", "true")
+			if tt.policy == "" {
+				t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
+				run(t, dst, "git", "config", "--global", "commit.gpgsign", "true")
 			}
-			run(t, dst, "git", "config", "commit.gpgsign", tt.targetPolicy)
 			run(t, dst, "git", "config", "gpg.program", filepath.Join(t.TempDir(), "missing-signer"))
 			run(t, dst, "git", "config", "user.signingkey", "test-signing-key")
 
-			if err := CopyLocalCommitSettings(ctx, src, dst); err != nil {
+			if err := CopyLocalCommitSettings(ctx, src, dst, tt.policy); err != nil {
 				t.Fatalf("CopyLocalCommitSettings failed: %v", err)
 			}
-			if got := run(t, dst, "git", "config", "--local", "--get", "commit.gpgsign"); got != tt.wantPolicy {
-				t.Fatalf("commit.gpgsign = %q, want %q", got, tt.wantPolicy)
+			if tt.policy != "" {
+				if got := run(t, dst, "git", "config", "--worktree", "--get", "commit.gpgsign"); got != tt.policy {
+					t.Fatalf("commit.gpgsign = %q, want %q", got, tt.policy)
+				}
+			} else {
+				cmd := exec.Command("git", "config", "--worktree", "--get", "commit.gpgsign")
+				cmd.Dir = dst
+				if err := cmd.Run(); err == nil {
+					t.Fatal("unset policy created a worktree override")
+				}
 			}
 			writeFile(t, filepath.Join(dst, "generated-fix.txt"), "generated review fix\n")
 			run(t, dst, "git", "add", "generated-fix.txt")

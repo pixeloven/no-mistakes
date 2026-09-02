@@ -793,6 +793,9 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 			intentSource = db.RunIntentSourceRerun
 		}
 	}
+	if selectedRun.CommitSigningPolicy == nil {
+		return "", fmt.Errorf("selected run commit signing policy is missing; the run cannot be safely rerun")
+	}
 
 	return m.startRunWithIntentSourceAndPolicy(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, selectedRun.CommitSigningPolicy)
 }
@@ -983,7 +986,7 @@ func (m *RunManager) startRunWithIntentSourceAndPolicy(ctx context.Context, repo
 			return "", fmt.Errorf("capture commit signing policy: %w", err)
 		}
 	}
-	if err := git.CopyLocalCommitSettings(ctx, repo.WorkingPath, wtDir); err != nil {
+	if err := git.CopyLocalCommitSettings(ctx, repo.WorkingPath, wtDir, commitPolicy); err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure worktree git commit settings: %s", err))
 		trackStartFailure("configure_worktree_identity")
 		return "", fmt.Errorf("configure worktree git commit settings: %w", err)
