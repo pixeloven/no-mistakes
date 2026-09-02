@@ -64,7 +64,7 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		timeout = AgentTimeout(sctx.Config)
 		if sctx.Run != nil && sctx.Run.CommitSigningPolicy != nil {
 			var err error
-			opts.Env, err = git.CommitSigningPolicyEnv(opts.Env, *sctx.Run.CommitSigningPolicy)
+			opts.Env, err = git.CommitSigningPolicyEnv(opts.Env, *sctx.Run.CommitSigningPolicy, sctx.Run.CommitSigningEffective)
 			if err != nil {
 				return nil, fmt.Errorf("apply commit signing policy to agent: %w", err)
 			}

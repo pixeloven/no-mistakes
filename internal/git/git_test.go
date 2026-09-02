@@ -290,6 +290,21 @@ func TestLocalCommitSigningPolicyCanonicalizesWorktreeScope(t *testing.T) {
 	}
 }
 
+func TestCaptureCommitSigningPolicyRejectsSharedLocalValueForUnset(t *testing.T) {
+	ctx := context.Background()
+	repo := initTestRepo(t)
+	run(t, repo, "git", "config", "extensions.worktreeConfig", "true")
+	run(t, repo, "git", "config", "--local", "commit.gpgsign", "true")
+
+	policy, effective, err := CaptureCommitSigningPolicy(ctx, repo)
+	if err == nil || !strings.Contains(err.Error(), "commit.gpgsign") {
+		t.Fatalf("expected exact-key shared policy rejection, got policy=%q effective=%v err=%v", policy, effective, err)
+	}
+	if got := run(t, repo, "git", "config", "--local", "--bool", "--get", "commit.gpgsign"); got != "true" {
+		t.Fatalf("shared local policy changed to %q", got)
+	}
+}
+
 func TestSetWorktreeCommitSigningPolicyRejectsStaleSharedLocalValue(t *testing.T) {
 	ctx := context.Background()
 	repo := initTestRepo(t)

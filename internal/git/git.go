@@ -587,13 +587,47 @@ func CommitAll(ctx context.Context, dir, message string) error {
 }
 
 // LocalCommitSigningPolicy returns the explicit worktree-scoped policy.
-// Empty means unset and preserves ordinary Git precedence. Worktree config is
-// required so admission cannot silently read shared configuration.
+// Empty means explicitly unset. Worktree config is required so admission
+// cannot silently read shared configuration.
 func LocalCommitSigningPolicy(ctx context.Context, dir string) (string, error) {
 	if err := requireWorktreeConfig(ctx, dir); err != nil {
 		return "", err
 	}
-	return configPolicyAtScope(ctx, dir, "--worktree")
+	policy, err := configPolicyAtScope(ctx, dir, "--worktree")
+	if err != nil || policy != "" {
+		return policy, err
+	}
+	local, err := configPolicyAtScope(ctx, dir, "--local")
+	if err != nil {
+		return "", err
+	}
+	if local != "" {
+		return "", fmt.Errorf("unsafe stale Git configuration key commit.gpgsign")
+	}
+	return "", nil
+}
+
+func CaptureCommitSigningPolicy(ctx context.Context, dir string) (string, *bool, error) {
+	policy, err := LocalCommitSigningPolicy(ctx, dir)
+	if err != nil || policy != "" {
+		return policy, nil, err
+	}
+	effective, err := Run(ctx, dir, "config", "--bool", "--get", "--default", "false", "commit.gpgsign")
+	if err != nil {
+		return "", nil, err
+	}
+	if effective != "true" && effective != "false" {
+		return "", nil, fmt.Errorf("invalid effective commit signing policy %q", effective)
+	}
+	confirmed, err := LocalCommitSigningPolicy(ctx, dir)
+	if err != nil {
+		return "", nil, err
+	}
+	if confirmed != "" {
+		return "", nil, fmt.Errorf("commit.gpgsign changed during signing policy capture")
+	}
+	value := effective == "true"
+	return "", &value, nil
 }
 
 // ValidateRestoredCommitSigningPolicy verifies that a run worktree has no
@@ -666,14 +700,26 @@ func configPolicyAtScopeWithEnv(ctx context.Context, dir string, env []string, s
 }
 
 // RunWithSigningPolicy runs Git with the supplied signing policy applied only
-// to this command. Unset leaves ambient Git precedence.
-func RunWithSigningPolicy(ctx context.Context, dir, policy string, args ...string) (string, error) {
+// to this command. Unset uses its captured effective boolean.
+func CommandCommitSigningPolicy(policy string, effective *bool) (string, error) {
 	if err := validateCommitSigningPolicy(policy); err != nil {
 		return "", err
 	}
 	if policy != "" {
-		args = append([]string{"-c", "commit.gpgsign=" + policy}, args...)
+		return policy, nil
 	}
+	if effective == nil {
+		return "", fmt.Errorf("effective commit signing policy is missing for explicit-unset commit.gpgsign")
+	}
+	return strconv.FormatBool(*effective), nil
+}
+
+func RunWithSigningPolicy(ctx context.Context, dir, policy string, effective *bool, args ...string) (string, error) {
+	commandPolicy, err := CommandCommitSigningPolicy(policy, effective)
+	if err != nil {
+		return "", err
+	}
+	args = append([]string{"-c", "commit.gpgsign=" + commandPolicy}, args...)
 	return Run(ctx, dir, args...)
 }
 

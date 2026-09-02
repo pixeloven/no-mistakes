@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -142,6 +146,51 @@ func TestRunAgentPropagatesPersistedCommitSigningPolicy(t *testing.T) {
 	sctx := &StepContext{Ctx: context.Background(), Agent: ag, Run: &db.Run{CommitSigningPolicy: &policy}}
 	if _, err := sctx.RunAgent(agent.RunOpts{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRunAgentFreezesEffectiveSigningPolicyForUnsetRun(t *testing.T) {
+	dir := t.TempDir()
+	initGitRepo(t, dir)
+	execGit(t, dir, "config", "gpg.program", filepath.Join(t.TempDir(), "missing-signer"))
+	execGit(t, dir, "config", "user.signingkey", "test-signing-key")
+	writeTestFile(t, dir, "agent-change.txt", "change\n")
+	execGit(t, dir, "add", "agent-change.txt")
+
+	policy := ""
+	effective := false
+	ag := &hangingAgent{
+		name: "commit",
+		runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			execGit(t, opts.CWD, "config", "--local", "commit.gpgsign", "true")
+			cmd := exec.Command("git", "commit", "-m", "agent change")
+			cmd.Dir = opts.CWD
+			cmd.Env = append(os.Environ(), opts.Env...)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return nil, fmt.Errorf("commit with frozen signing policy: %w: %s", err, out)
+			}
+			return &agent.Result{Text: "ok"}, nil
+		},
+	}
+	sctx := &StepContext{
+		Ctx:   context.Background(),
+		Agent: ag,
+		Run: &db.Run{
+			CommitSigningPolicy:    &policy,
+			CommitSigningEffective: &effective,
+		},
+	}
+	if _, err := sctx.RunAgent(agent.RunOpts{CWD: dir}); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "cat-file", "commit", "HEAD")
+	cmd.Dir = dir
+	commit, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(commit), "\ngpgsig ") || strings.HasPrefix(string(commit), "gpgsig ") {
+		t.Fatal("unset run's frozen false policy produced a signed agent commit")
 	}
 }
 

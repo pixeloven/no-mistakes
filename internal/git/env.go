@@ -14,14 +14,12 @@ import (
 
 type environmentContextKey struct{}
 
-func CommitSigningPolicyEnv(extra []string, policy string) ([]string, error) {
-	if err := validateCommitSigningPolicy(policy); err != nil {
+func CommitSigningPolicyEnv(extra []string, policy string, effective *bool) ([]string, error) {
+	commandPolicy, err := CommandCommitSigningPolicy(policy, effective)
+	if err != nil {
 		return nil, err
 	}
 	result := append([]string(nil), extra...)
-	if policy == "" {
-		return result, nil
-	}
 	count := 0
 	for _, entry := range append(os.Environ(), extra...) {
 		key, value, ok := strings.Cut(entry, "=")
@@ -37,7 +35,7 @@ func CommitSigningPolicyEnv(extra []string, policy string) ([]string, error) {
 	return append(result,
 		"GIT_CONFIG_COUNT="+strconv.Itoa(count+1),
 		"GIT_CONFIG_KEY_"+strconv.Itoa(count)+"=commit.gpgsign",
-		"GIT_CONFIG_VALUE_"+strconv.Itoa(count)+"="+policy,
+		"GIT_CONFIG_VALUE_"+strconv.Itoa(count)+"="+commandPolicy,
 	), nil
 }
 

@@ -885,7 +885,7 @@ func TestPrepareRecoveredRunRejectsMismatchedSigningPolicy(t *testing.T) {
 	if err := d.SetRunAwaitingAgent(run.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.SetRunCommitSigningPolicy(run.ID, "false"); err != nil {
+	if err := d.SetRunCommitSigningPolicy(run.ID, "false", nil); err != nil {
 		t.Fatal(err)
 	}
 

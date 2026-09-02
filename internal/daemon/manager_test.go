@@ -263,6 +263,51 @@ func TestPushReceivedRejectsSharedSigningPolicyWithoutWorktreeConfig(t *testing.
 	}
 }
 
+func TestPushReceivedPersistsAndRerunInheritsEffectiveSigningForUnsetPolicy(t *testing.T) {
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+	})
+
+	repo, headSHA := setupTestGitRepo(t, p, d, "unset-signing-policy-repo")
+	gitCmd(t, repo.WorkingPath, "config", "--worktree", "--unset-all", "commit.gpgsign")
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
+	gitCmd(t, repo.WorkingPath, "config", "--global", "commit.gpgsign", "true")
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var first ipc.PushReceivedResult
+	if err := client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir(repo.ID), Ref: "refs/heads/main", New: headSHA,
+	}, &first); err != nil {
+		t.Fatal(err)
+	}
+	firstRun := waitForRunTerminalState(t, d, first.RunID)
+	if firstRun.CommitSigningPolicy == nil || *firstRun.CommitSigningPolicy != "" {
+		t.Fatalf("explicit signing policy = %v, want unset", firstRun.CommitSigningPolicy)
+	}
+	if firstRun.CommitSigningEffective == nil || !*firstRun.CommitSigningEffective {
+		t.Fatalf("effective signing policy = %v, want true", firstRun.CommitSigningEffective)
+	}
+
+	gitCmd(t, repo.WorkingPath, "config", "--global", "commit.gpgsign", "false")
+	var rerun ipc.RerunResult
+	if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{
+		RepoID: repo.ID, Branch: "main", PreviousRunID: first.RunID,
+	}, &rerun); err != nil {
+		t.Fatal(err)
+	}
+	rerunState := waitForRunTerminalState(t, d, rerun.RunID)
+	if rerunState.CommitSigningPolicy == nil || *rerunState.CommitSigningPolicy != "" {
+		t.Fatalf("rerun explicit signing policy = %v, want unset", rerunState.CommitSigningPolicy)
+	}
+	if rerunState.CommitSigningEffective == nil || !*rerunState.CommitSigningEffective {
+		t.Fatalf("rerun effective signing policy = %v, want inherited true", rerunState.CommitSigningEffective)
+	}
+}
+
 func TestPushReceivedAllowsDifferentBranchRunsConcurrently(t *testing.T) {
 	started := make(chan string, 2)
 	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
