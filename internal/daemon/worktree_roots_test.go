@@ -863,7 +863,7 @@ func TestPrepareRecoveredRun_LocatesThePlacementItsRunRecorded(t *testing.T) {
 	}
 }
 
-func TestPrepareRecoveredRunRestoresPersistedSigningPolicy(t *testing.T) {
+func TestPrepareRecoveredRunRejectsMismatchedSigningPolicy(t *testing.T) {
 	p := paths.WithRoot(t.TempDir())
 	if err := p.EnsureDirs(); err != nil {
 		t.Fatal(err)
@@ -890,26 +890,27 @@ func TestPrepareRecoveredRunRestoresPersistedSigningPolicy(t *testing.T) {
 	}
 
 	worktree := filepath.Join(t.TempDir(), "repo-runs", run.ID)
+	gitCmd(t, p.RepoDir(repo.ID), "config", "extensions.worktreeConfig", "true")
 	gitCmd(t, p.RepoDir(repo.ID), "worktree", "add", "--detach", worktree, headSHA)
 	if err := d.SetRunWorktreeDir(run.ID, worktree); err != nil {
 		t.Fatal(err)
 	}
-	gitCmd(t, worktree, "config", "commit.gpgsign", "true")
+	gitCmd(t, worktree, "config", "--worktree", "commit.gpgsign", "true")
 
 	stored, err := d.GetRun(run.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Policy restoration precedes validation of the durable approval gate. This
-	// fixture intentionally omits unrelated step records and checks the restored
-	// Git state at that recovery boundary.
-	_, _ = NewRunManager(d, p, nil).prepareRecoveredRun(context.Background(), stored)
-	got, err := gitpkg.Run(context.Background(), worktree, "config", "--bool", "--get", "commit.gpgsign")
+	_, err = NewRunManager(d, p, nil).prepareRecoveredRun(context.Background(), stored)
+	if err == nil || !strings.Contains(err.Error(), "commit.gpgsign") {
+		t.Fatalf("expected signing policy mismatch, got %v", err)
+	}
+	got, err := gitpkg.Run(context.Background(), worktree, "config", "--worktree", "--bool", "--get", "commit.gpgsign")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "false" {
-		t.Fatalf("recovered worktree policy = %q, want persisted false", got)
+	if got != "true" {
+		t.Fatalf("recovery mutated worktree policy to %q", got)
 	}
 }
 

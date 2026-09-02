@@ -263,42 +263,49 @@ func TestCopyLocalCommitSettings_PreservesSignedAndDefaultBehavior(t *testing.T)
 	}
 }
 
-func TestLocalCommitSigningPolicyCanonicalizesAndFallsBackToLocal(t *testing.T) {
+func TestLocalCommitSigningPolicyCanonicalizesWorktreeScope(t *testing.T) {
 	ctx := context.Background()
 	repo := initTestRepo(t)
 	run(t, repo, "git", "config", "extensions.worktreeConfig", "true")
-	run(t, repo, "git", "config", "--local", "commit.gpgsign", "yes")
 
 	linked := filepath.Join(t.TempDir(), "linked")
 	run(t, repo, "git", "worktree", "add", "-b", "linked", linked)
+	run(t, repo, "git", "config", "--local", "commit.gpgsign", "false")
+	run(t, linked, "git", "config", "--worktree", "commit.gpgsign", "yes")
 	policy, err := LocalCommitSigningPolicy(ctx, linked)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if policy != "true" {
-		t.Fatalf("policy = %q, want canonical true from local fallback", policy)
+		t.Fatalf("policy = %q, want canonical worktree value true", policy)
 	}
 }
 
-func TestSetWorktreeCommitSigningPolicyRestoresAllStatesWithLocalFallback(t *testing.T) {
+func TestSetWorktreeCommitSigningPolicyRejectsStaleSharedLocalValue(t *testing.T) {
 	ctx := context.Background()
 	repo := initTestRepo(t)
+	run(t, repo, "git", "config", "extensions.worktreeConfig", "true")
 	linked := filepath.Join(t.TempDir(), "linked")
 	run(t, repo, "git", "worktree", "add", "-b", "linked", linked)
 
 	if err := SetWorktreeCommitSigningPolicy(ctx, linked, "false"); err != nil {
 		t.Fatal(err)
 	}
-	if got := run(t, linked, "git", "config", "--local", "--bool", "--get", "commit.gpgsign"); got != "false" {
+	if got := run(t, linked, "git", "config", "--worktree", "--bool", "--get", "commit.gpgsign"); got != "false" {
 		t.Fatalf("policy = %q, want false", got)
 	}
-	if err := SetWorktreeCommitSigningPolicy(ctx, linked, ""); err != nil {
-		t.Fatal(err)
+	run(t, linked, "git", "config", "--worktree", "--unset-all", "commit.gpgsign")
+	run(t, repo, "git", "config", "--local", "commit.gpgsign", "true")
+	if err := SetWorktreeCommitSigningPolicy(ctx, linked, ""); err == nil || !strings.Contains(err.Error(), "commit.gpgsign") {
+		t.Fatalf("expected exact-key stale shared config error, got %v", err)
 	}
-	cmd := exec.Command("git", "config", "--local", "--get", "commit.gpgsign")
+	if got := run(t, repo, "git", "config", "--local", "--bool", "--get", "commit.gpgsign"); got != "true" {
+		t.Fatalf("shared local policy changed to %q", got)
+	}
+	cmd := exec.Command("git", "config", "--worktree", "--get", "commit.gpgsign")
 	cmd.Dir = linked
 	if err := cmd.Run(); err == nil {
-		t.Fatal("unset policy remained in local config")
+		t.Fatal("stale shared config rejection created a worktree override")
 	}
 }
 
