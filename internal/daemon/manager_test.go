@@ -185,6 +185,20 @@ func (s *commitSigningPolicyStep) Execute(sctx *pipeline.StepContext) (*pipeline
 	return &pipeline.StepOutcome{}, nil
 }
 
+type signingPolicyObserverStep struct {
+	observed chan<- string
+}
+
+func (s *signingPolicyObserverStep) Name() types.StepName { return types.StepReview }
+func (s *signingPolicyObserverStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	policy, err := git.Run(sctx.Ctx, sctx.WorkDir, "config", "--worktree", "--bool", "--get", "commit.gpgsign")
+	if err != nil {
+		return nil, err
+	}
+	s.observed <- policy
+	return &pipeline.StepOutcome{}, nil
+}
+
 func TestPushReceivedCarriesExplicitUnsignedPolicyIntoRunWorktree(t *testing.T) {
 	observed := make(chan string, 1)
 	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
@@ -222,6 +236,75 @@ func TestPushReceivedCarriesExplicitUnsignedPolicyIntoRunWorktree(t *testing.T) 
 	}
 	if run := waitForRunTerminalState(t, d, result.RunID); run.Status != types.RunCompleted {
 		t.Fatalf("run status = %q, want %q: %v", run.Status, types.RunCompleted, run.Error)
+	}
+}
+
+func TestPushReceivedRejectsSharedSigningPolicyWithoutWorktreeConfig(t *testing.T) {
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+	})
+
+	repo, headSHA := setupTestGitRepo(t, p, d, "shared-signing-policy-repo")
+	gitCmd(t, repo.WorkingPath, "config", "--worktree", "--unset-all", "commit.gpgsign")
+	gitCmd(t, repo.WorkingPath, "config", "--local", "extensions.worktreeConfig", "false")
+	gitCmd(t, repo.WorkingPath, "config", "--local", "commit.gpgsign", "false")
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var result ipc.PushReceivedResult
+	err = client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir(repo.ID), Ref: "refs/heads/main", New: headSHA,
+	}, &result)
+	if err == nil || !strings.Contains(err.Error(), "extensions.worktreeConfig=true") {
+		t.Fatalf("expected actionable worktree config rejection, got %v", err)
+	}
+}
+
+func TestPushReceivedPersistsAndRerunInheritsEffectiveSigningForUnsetPolicy(t *testing.T) {
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+	})
+
+	repo, headSHA := setupTestGitRepo(t, p, d, "unset-signing-policy-repo")
+	gitCmd(t, repo.WorkingPath, "config", "--worktree", "--unset-all", "commit.gpgsign")
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
+	gitCmd(t, repo.WorkingPath, "config", "--global", "commit.gpgsign", "true")
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var first ipc.PushReceivedResult
+	if err := client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir(repo.ID), Ref: "refs/heads/main", New: headSHA,
+	}, &first); err != nil {
+		t.Fatal(err)
+	}
+	firstRun := waitForRunTerminalState(t, d, first.RunID)
+	if firstRun.CommitSigningPolicy == nil || *firstRun.CommitSigningPolicy != "" {
+		t.Fatalf("explicit signing policy = %v, want unset", firstRun.CommitSigningPolicy)
+	}
+	if firstRun.CommitSigningEffective == nil || !*firstRun.CommitSigningEffective {
+		t.Fatalf("effective signing policy = %v, want true", firstRun.CommitSigningEffective)
+	}
+
+	gitCmd(t, repo.WorkingPath, "config", "--global", "commit.gpgsign", "false")
+	var rerun ipc.RerunResult
+	if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{
+		RepoID: repo.ID, Branch: "main", PreviousRunID: first.RunID,
+	}, &rerun); err != nil {
+		t.Fatal(err)
+	}
+	rerunState := waitForRunTerminalState(t, d, rerun.RunID)
+	if rerunState.CommitSigningPolicy == nil || *rerunState.CommitSigningPolicy != "" {
+		t.Fatalf("rerun explicit signing policy = %v, want unset", rerunState.CommitSigningPolicy)
+	}
+	if rerunState.CommitSigningEffective == nil || !*rerunState.CommitSigningEffective {
+		t.Fatalf("rerun effective signing policy = %v, want inherited true", rerunState.CommitSigningEffective)
 	}
 }
 
@@ -699,13 +782,13 @@ func TestRerunSkipStepsConfiguresExecutor(t *testing.T) {
 	}
 }
 
-func TestRerunInheritsIntentFromSelectedRun(t *testing.T) {
-	step := &mockPassStep{name: types.StepReview}
+func TestRerunInheritsIntentAndSigningPolicyFromSelectedRun(t *testing.T) {
+	observed := make(chan string, 2)
 	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
-		return []pipeline.Step{step}
+		return []pipeline.Step{&signingPolicyObserverStep{observed: observed}}
 	})
 
-	_, headSHA := setupTestGitRepo(t, p, d, "selected-rerun-repo")
+	repo, headSHA := setupTestGitRepo(t, p, d, "selected-rerun-repo")
 	client, err := ipc.Dial(p.Socket())
 	if err != nil {
 		t.Fatal(err)
@@ -723,6 +806,15 @@ func TestRerunInheritsIntentFromSelectedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForRunTerminalState(t, d, first.RunID)
+	select {
+	case policy := <-observed:
+		if policy != "false" {
+			t.Fatalf("first run signing policy = %q, want false", policy)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("first run did not observe its signing policy")
+	}
+	gitCmd(t, repo.WorkingPath, "config", "--worktree", "commit.gpgsign", "true")
 	selectedIntent := "  selected exact requirements\n"
 	if err := d.UpdateRunIntent(first.RunID, db.RunIntent{Summary: selectedIntent, Source: db.RunIntentSourceAgent, Score: 1}); err != nil {
 		t.Fatal(err)
@@ -755,6 +847,20 @@ func TestRerunInheritsIntentFromSelectedRun(t *testing.T) {
 	}
 	if got.IntentSource == nil || *got.IntentSource != db.RunIntentSourceRerun {
 		t.Fatalf("intent source = %v, want %q", got.IntentSource, db.RunIntentSourceRerun)
+	}
+	if got.CommitSigningPolicy == nil || *got.CommitSigningPolicy != "false" {
+		t.Fatalf("commit signing policy = %v, want inherited false", got.CommitSigningPolicy)
+	}
+	if got.Status != types.RunCompleted {
+		t.Fatalf("rerun status = %q, want %q: %v", got.Status, types.RunCompleted, got.Error)
+	}
+	select {
+	case policy := <-observed:
+		if policy != "false" {
+			t.Fatalf("rerun worktree signing policy = %q, want inherited false", policy)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("rerun did not observe its inherited signing policy")
 	}
 }
 

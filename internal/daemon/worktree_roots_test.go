@@ -12,6 +12,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	gitpkg "github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
@@ -859,6 +860,57 @@ func TestPrepareRecoveredRun_LocatesThePlacementItsRunRecorded(t *testing.T) {
 	}
 	if _, err := m.prepareRecoveredRun(context.Background(), stored); err != nil && strings.Contains(err.Error(), "worktree is missing") {
 		t.Fatalf("recovery lost the run's recorded worktree %q: %v", created, err)
+	}
+}
+
+func TestPrepareRecoveredRunRejectsMismatchedSigningPolicy(t *testing.T) {
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	repo, headSHA := setupTestGitRepo(t, p, d, "signing-recovery")
+	run, err := d.InsertRun(repo.ID, "feature", headSHA, headSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetRunAwaitingAgent(run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetRunCommitSigningPolicy(run.ID, "false", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	worktree := filepath.Join(t.TempDir(), "repo-runs", run.ID)
+	gitCmd(t, p.RepoDir(repo.ID), "config", "extensions.worktreeConfig", "true")
+	gitCmd(t, p.RepoDir(repo.ID), "worktree", "add", "--detach", worktree, headSHA)
+	if err := d.SetRunWorktreeDir(run.ID, worktree); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, worktree, "config", "--worktree", "commit.gpgsign", "true")
+
+	stored, err := d.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewRunManager(d, p, nil).prepareRecoveredRun(context.Background(), stored)
+	if err == nil || !strings.Contains(err.Error(), "commit.gpgsign") {
+		t.Fatalf("expected signing policy mismatch, got %v", err)
+	}
+	got, err := gitpkg.Run(context.Background(), worktree, "config", "--worktree", "--bool", "--get", "commit.gpgsign")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "true" {
+		t.Fatalf("recovery mutated worktree policy to %q", got)
 	}
 }
 

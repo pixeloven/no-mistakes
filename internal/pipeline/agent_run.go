@@ -10,6 +10,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 )
 
@@ -72,6 +73,41 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		}
 		return ag.Run(ctx, opts)
 	})
+}
+
+type commitSigningPolicyAgent struct {
+	inner     agent.Agent
+	policy    string
+	effective *bool
+}
+
+func (a *commitSigningPolicyAgent) Name() string { return a.inner.Name() }
+
+func (a *commitSigningPolicyAgent) Close() error { return a.inner.Close() }
+
+func (a *commitSigningPolicyAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+	var err error
+	opts.Env, err = git.CommitSigningPolicyEnv(opts.Env, a.policy, a.effective)
+	if err != nil {
+		return nil, fmt.Errorf("apply commit signing policy to agent: %w", err)
+	}
+	return a.inner.Run(ctx, opts)
+}
+
+func (a *commitSigningPolicyAgent) SupportsSessionResume() bool {
+	return agent.SupportsSessionResume(a.inner)
+}
+
+func (a *commitSigningPolicyAgent) SupportsSessionProvider(provider string) bool {
+	return agent.SupportsSessionProvider(a.inner, provider)
+}
+
+func (a *commitSigningPolicyAgent) ReportsAgentAttempts() bool {
+	return agent.ReportsAgentAttempts(a.inner)
+}
+
+func (a *commitSigningPolicyAgent) NeutralizesGateInstructions() bool {
+	return agent.NeutralizesGateInstructions(a.inner)
 }
 
 func invokeAgent(parent context.Context, timeout time.Duration, activity *agentActivity, run func(context.Context) (*agent.Result, error)) (*agent.Result, error) {

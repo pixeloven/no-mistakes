@@ -803,6 +803,13 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 
 	stepAgent := e.agent
 	if stepAgent != nil {
+		if run.CommitSigningPolicy != nil {
+			stepAgent = &commitSigningPolicyAgent{
+				inner:     stepAgent,
+				policy:    *run.CommitSigningPolicy,
+				effective: run.CommitSigningEffective,
+			}
+		}
 		// Innermost: default-by-construction invocation deadline so a step
 		// that calls Agent.Run directly cannot hang the run.
 		stepAgent = &timeoutAgent{inner: stepAgent, timeout: AgentTimeout(e.config)}

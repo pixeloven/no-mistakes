@@ -201,6 +201,17 @@ func stepGitRun(sctx *pipeline.StepContext, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+func stepGitRunWithSigningPolicy(sctx *pipeline.StepContext, args ...string) (string, error) {
+	if sctx.Run != nil && sctx.Run.CommitSigningPolicy != nil {
+		policy, err := git.CommandCommitSigningPolicy(*sctx.Run.CommitSigningPolicy, sctx.Run.CommitSigningEffective)
+		if err != nil {
+			return "", err
+		}
+		args = append([]string{"-c", "commit.gpgsign=" + policy}, args...)
+	}
+	return stepGitRun(sctx, args...)
+}
+
 func stepGitHeadSHA(sctx *pipeline.StepContext) (string, error) {
 	return stepGitRun(sctx, "rev-parse", "HEAD")
 }

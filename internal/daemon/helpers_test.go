@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	gitpkg "github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/logstore"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
@@ -258,7 +259,8 @@ func setupTestGitRepo(t *testing.T, p *paths.Paths, d *db.DB, repoID string) (*d
 	gitCmd(t, workDir, "init")
 	gitCmd(t, workDir, "config", "user.email", "test@test.com")
 	gitCmd(t, workDir, "config", "user.name", "Test")
-	gitCmd(t, workDir, "config", "commit.gpgsign", "false")
+	gitCmd(t, workDir, "config", "extensions.worktreeConfig", "true")
+	gitCmd(t, workDir, "config", "--worktree", "commit.gpgsign", "false")
 	if err := os.WriteFile(filepath.Join(workDir, "test.txt"), []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -274,6 +276,9 @@ func setupTestGitRepo(t *testing.T, p *paths.Paths, d *db.DB, repoID string) (*d
 	// Create bare repo at the expected gate path.
 	bareDir := p.RepoDir(repoID)
 	gitCmd(t, "", "init", "--bare", bareDir)
+	if err := gitpkg.IsolateHooksPath(ctx, bareDir); err != nil {
+		t.Fatal(err)
+	}
 
 	// Push from work to bare so it has refs.
 	gitCmd(t, workDir, "remote", "add", "gate", bareDir)

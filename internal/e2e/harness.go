@@ -253,7 +253,8 @@ func (h *Harness) initGitRepos() {
 	mustGit(h.WorkDir, "init", "--initial-branch=main")
 	mustGit(h.WorkDir, "config", "user.email", "e2e@example.com")
 	mustGit(h.WorkDir, "config", "user.name", "E2E Test")
-	mustGit(h.WorkDir, "config", "commit.gpgsign", "false")
+	mustGit(h.WorkDir, "config", "extensions.worktreeConfig", "true")
+	mustGit(h.WorkDir, "config", "--worktree", "commit.gpgsign", "false")
 
 	// One initial commit so the branch exists and the gate can rebase
 	// against a real base.

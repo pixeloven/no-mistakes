@@ -159,6 +159,16 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if !samePath(resolveGitPath(workDir, commonDir), gateDir) {
 		return nil, fmt.Errorf("worktree does not belong to its gate repository")
 	}
+	if run.CommitSigningPolicy == nil {
+		return nil, fmt.Errorf("commit signing policy is missing; the run cannot be safely recovered")
+	}
+	commitPolicy := strings.TrimSpace(*run.CommitSigningPolicy)
+	if commitPolicy == "" && run.CommitSigningEffective == nil {
+		return nil, fmt.Errorf("effective commit signing policy is missing; the run cannot be safely recovered")
+	}
+	if err := git.ValidateRestoredCommitSigningPolicy(ctx, workDir, commitPolicy); err != nil {
+		return nil, err
+	}
 
 	execSteps := m.steps()
 	if err := pipeline.ValidateRecoveredRun(m.db, run, execSteps); err != nil {
@@ -787,8 +797,14 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 			intentSource = db.RunIntentSourceRerun
 		}
 	}
+	if selectedRun.CommitSigningPolicy == nil {
+		return "", fmt.Errorf("selected run commit signing policy is missing; the run cannot be safely rerun")
+	}
+	if strings.TrimSpace(*selectedRun.CommitSigningPolicy) == "" && selectedRun.CommitSigningEffective == nil {
+		return "", fmt.Errorf("selected run effective commit signing policy is missing; the run cannot be safely rerun")
+	}
 
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource)
+	return m.startRunWithIntentSourceAndPolicy(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, selectedRun.CommitSigningPolicy, selectedRun.CommitSigningEffective)
 }
 
 func resolveRerunHead(ctx context.Context, gateDir, branch string, latest *db.Run) (string, error) {
@@ -857,6 +873,10 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 // when no intent is supplied, RunIntentSourceAgent for a new explicit
 // override, and RunIntentSourceRerun for inherited explicit intent.
 func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source string) (string, error) {
+	return m.startRunWithIntentSourceAndPolicy(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, source, nil, nil)
+}
+
+func (m *RunManager) startRunWithIntentSourceAndPolicy(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source string, inheritedPolicy *string, inheritedEffective *bool) (string, error) {
 	branchRole := telemetryBranchRole(branch, repo.DefaultBranch)
 	trackStartFailure := func(stage string) {
 		telemetry.Track("run", telemetry.Fields{
@@ -962,11 +982,36 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		}
 	}()
 
-	if err := git.CopyLocalCommitSettings(ctx, repo.WorkingPath, wtDir); err != nil {
+	commitPolicy := ""
+	var commitEffective *bool
+	if inheritedPolicy != nil {
+		commitPolicy = strings.TrimSpace(*inheritedPolicy)
+		commitEffective = inheritedEffective
+	} else {
+		commitPolicy, commitEffective, err = git.CaptureCommitSigningPolicy(ctx, repo.WorkingPath)
+		if err != nil {
+			m.db.UpdateRunError(run.ID, fmt.Sprintf("capture commit signing policy: %s", err))
+			trackStartFailure("capture_commit_signing_policy")
+			return "", fmt.Errorf("capture commit signing policy: %w", err)
+		}
+	}
+	if err := git.CopyLocalCommitSettings(ctx, repo.WorkingPath, wtDir, commitPolicy); err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure worktree git commit settings: %s", err))
 		trackStartFailure("configure_worktree_identity")
 		return "", fmt.Errorf("configure worktree git commit settings: %w", err)
 	}
+	if err := git.ValidateRestoredCommitSigningPolicy(ctx, wtDir, commitPolicy); err != nil {
+		m.db.UpdateRunError(run.ID, fmt.Sprintf("validate worktree commit signing policy: %s", err))
+		trackStartFailure("validate_commit_signing_policy")
+		return "", fmt.Errorf("validate worktree commit signing policy: %w", err)
+	}
+	if err := m.db.SetRunCommitSigningPolicy(run.ID, commitPolicy, commitEffective); err != nil {
+		m.db.UpdateRunError(run.ID, fmt.Sprintf("record commit signing policy: %s", err))
+		trackStartFailure("record_commit_signing_policy")
+		return "", fmt.Errorf("record commit signing policy: %w", err)
+	}
+	run.CommitSigningPolicy = &commitPolicy
+	run.CommitSigningEffective = commitEffective
 	// Fetch the trusted default branch and resolve it to an exact commit SHA
 	// before any read. Reading the trusted config at this pinned SHA (rather
 	// than the origin/<defaultBranch> remote-tracking ref) is what makes a
