@@ -586,17 +586,41 @@ func CommitAll(ctx context.Context, dir, message string) error {
 	return err
 }
 
-// LocalCommitSigningPolicy returns the explicit worktree/local commit signing policy.
-// Empty means unset and preserves ordinary Git precedence.
+// LocalCommitSigningPolicy returns the explicit worktree-scoped policy.
+// Empty means unset and preserves ordinary Git precedence. Worktree config is
+// required so admission cannot silently read shared configuration.
 func LocalCommitSigningPolicy(ctx context.Context, dir string) (string, error) {
-	policy, err := configPolicyAtScope(ctx, dir, "--worktree")
-	if err == nil && policy != "" {
-		return policy, nil
+	return configPolicyAtScope(ctx, dir, "--worktree")
+}
+
+// ValidateRestoredCommitSigningPolicy verifies that a run worktree has no
+// conflicting signing configuration. An unset policy rejects a stale shared
+// gate-local key rather than inheriting or mutating it.
+func ValidateRestoredCommitSigningPolicy(ctx context.Context, dir, policy string) error {
+	if err := validateCommitSigningPolicy(policy); err != nil {
+		return err
 	}
-	if err != nil && !isWorktreeConfigWriteUnavailable(err) {
-		return "", err
+	worktree, err := configPolicyAtScope(ctx, dir, "--worktree")
+	if err != nil {
+		return fmt.Errorf("worktree-scoped Git configuration is required: %w", err)
 	}
-	return configPolicyAtScope(ctx, dir, "--local")
+	if policy != "" {
+		if worktree != policy {
+			return fmt.Errorf("restored commit signing policy mismatch: commit.gpgsign")
+		}
+		return nil
+	}
+	if worktree != "" {
+		return fmt.Errorf("unsafe stale Git configuration key commit.gpgsign")
+	}
+	local, err := configPolicyAtScope(ctx, dir, "--local")
+	if err != nil {
+		return err
+	}
+	if local != "" {
+		return fmt.Errorf("unsafe stale Git configuration key commit.gpgsign")
+	}
+	return nil
 }
 
 func configPolicyAtScope(ctx context.Context, dir, scope string) (string, error) {
@@ -657,11 +681,11 @@ func SetWorktreeCommitSigningPolicy(ctx context.Context, dir, policy string) err
 	if err := validateCommitSigningPolicy(policy); err != nil {
 		return err
 	}
+	if policy == "" {
+		return ValidateRestoredCommitSigningPolicy(ctx, dir, policy)
+	}
 	if err := setCommitSigningPolicyAtScope(ctx, dir, "--worktree", policy); err != nil {
-		if !isWorktreeConfigWriteUnavailable(err) {
-			return err
-		}
-		return setCommitSigningPolicyAtScope(ctx, dir, "--local", policy)
+		return fmt.Errorf("worktree-scoped Git configuration is required: %w", err)
 	}
 	return nil
 }

@@ -159,10 +159,11 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if !samePath(resolveGitPath(workDir, commonDir), gateDir) {
 		return nil, fmt.Errorf("worktree does not belong to its gate repository")
 	}
-	if run.CommitSigningPolicy != nil {
-		if err := git.SetWorktreeCommitSigningPolicy(ctx, workDir, strings.TrimSpace(*run.CommitSigningPolicy)); err != nil {
-			return nil, err
-		}
+	if run.CommitSigningPolicy == nil {
+		return nil, fmt.Errorf("commit signing policy is missing; the run cannot be safely recovered")
+	}
+	if err := git.ValidateRestoredCommitSigningPolicy(ctx, workDir, strings.TrimSpace(*run.CommitSigningPolicy)); err != nil {
+		return nil, err
 	}
 
 	execSteps := m.steps()
@@ -987,10 +988,10 @@ func (m *RunManager) startRunWithIntentSourceAndPolicy(ctx context.Context, repo
 		trackStartFailure("configure_worktree_identity")
 		return "", fmt.Errorf("configure worktree git commit settings: %w", err)
 	}
-	if err := git.SetWorktreeCommitSigningPolicy(ctx, wtDir, commitPolicy); err != nil {
-		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure worktree commit signing policy: %s", err))
-		trackStartFailure("configure_commit_signing_policy")
-		return "", fmt.Errorf("configure worktree commit signing policy: %w", err)
+	if err := git.ValidateRestoredCommitSigningPolicy(ctx, wtDir, commitPolicy); err != nil {
+		m.db.UpdateRunError(run.ID, fmt.Sprintf("validate worktree commit signing policy: %s", err))
+		trackStartFailure("validate_commit_signing_policy")
+		return "", fmt.Errorf("validate worktree commit signing policy: %w", err)
 	}
 	if err := m.db.SetRunCommitSigningPolicy(run.ID, commitPolicy); err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("record commit signing policy: %s", err))
