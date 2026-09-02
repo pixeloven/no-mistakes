@@ -143,7 +143,14 @@ func TestRunAgentPropagatesPersistedCommitSigningPolicy(t *testing.T) {
 			return &agent.Result{Text: "ok"}, nil
 		},
 	}
-	sctx := &StepContext{Ctx: context.Background(), Agent: ag, Run: &db.Run{CommitSigningPolicy: &policy}}
+	sctx := &StepContext{
+		Ctx: context.Background(),
+		Agent: &commitSigningPolicyAgent{
+			inner:  ag,
+			policy: policy,
+		},
+		Run: &db.Run{CommitSigningPolicy: &policy},
+	}
 	if _, err := sctx.RunAgent(agent.RunOpts{}); err != nil {
 		t.Fatal(err)
 	}
@@ -173,8 +180,12 @@ func TestRunAgentFreezesEffectiveSigningPolicyForUnsetRun(t *testing.T) {
 		},
 	}
 	sctx := &StepContext{
-		Ctx:   context.Background(),
-		Agent: ag,
+		Ctx: context.Background(),
+		Agent: &commitSigningPolicyAgent{
+			inner:     ag,
+			policy:    policy,
+			effective: &effective,
+		},
 		Run: &db.Run{
 			CommitSigningPolicy:    &policy,
 			CommitSigningEffective: &effective,
@@ -193,6 +204,89 @@ func TestRunAgentFreezesEffectiveSigningPolicyForUnsetRun(t *testing.T) {
 		t.Fatal("unset run's frozen false policy produced a signed agent commit")
 	}
 }
+
+type intentFirstPersistentSigningAgent struct {
+	serverEnv []string
+	calls     int
+	commitErr error
+}
+
+func (a *intentFirstPersistentSigningAgent) Name() string { return "persistent-signing" }
+
+func (a *intentFirstPersistentSigningAgent) Close() error { return nil }
+
+func (a *intentFirstPersistentSigningAgent) Run(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+	a.calls++
+	if a.calls == 1 {
+		a.serverEnv = append([]string(nil), opts.Env...)
+		return &agent.Result{Text: "intent"}, nil
+	}
+	cmd := exec.Command("git", "commit", "-m", "persistent agent change")
+	cmd.Dir = opts.CWD
+	cmd.Env = append(os.Environ(), a.serverEnv...)
+	_, a.commitErr = cmd.CombinedOutput()
+	return &agent.Result{Text: "work"}, nil
+}
+
+func TestExecutorIntentFirstPersistentAgentUsesRunSigningPolicy(t *testing.T) {
+	tests := []struct {
+		name          string
+		policy        string
+		effective     *bool
+		mutatedPolicy string
+		wantCommit    bool
+	}{
+		{name: "explicit true", policy: "true", mutatedPolicy: "false", wantCommit: false},
+		{name: "explicit false", policy: "false", mutatedPolicy: "true", wantCommit: true},
+		{name: "effective unset false", policy: "", effective: boolPointer(false), mutatedPolicy: "true", wantCommit: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			database, p, run, repo := setupTest(t)
+			workDir := t.TempDir()
+			initGitRepo(t, workDir)
+			execGit(t, workDir, "config", "gpg.program", filepath.Join(t.TempDir(), "missing-signer"))
+			execGit(t, workDir, "config", "user.signingkey", "test-signing-key")
+			writeTestFile(t, workDir, "agent-change.txt", "change\n")
+			execGit(t, workDir, "add", "agent-change.txt")
+
+			run.CommitSigningPolicy = &tt.policy
+			run.CommitSigningEffective = tt.effective
+			ag := &intentFirstPersistentSigningAgent{}
+			steps := []Step{
+				&adaptiveCallStep{
+					name: types.StepIntent,
+					fn: func(sctx *StepContext) (*StepOutcome, error) {
+						_, err := sctx.Agent.Run(sctx.Ctx, agent.RunOpts{CWD: workDir, Prompt: "intent"})
+						return &StepOutcome{}, err
+					},
+				},
+				&adaptiveCallStep{
+					name: types.StepReview,
+					fn: func(sctx *StepContext) (*StepOutcome, error) {
+						execGit(t, workDir, "config", "--local", "commit.gpgsign", tt.mutatedPolicy)
+						_, err := sctx.Agent.Run(sctx.Ctx, agent.RunOpts{CWD: workDir, Prompt: "work"})
+						return &StepOutcome{}, err
+					},
+				},
+			}
+
+			executor := NewExecutor(database, p, &config.Config{}, ag, steps, nil)
+			if err := executor.Execute(context.Background(), run, repo, workDir); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if ag.calls != 2 {
+				t.Fatalf("agent calls = %d, want 2", ag.calls)
+			}
+			if gotCommit := ag.commitErr == nil; gotCommit != tt.wantCommit {
+				t.Fatalf("commit succeeded = %v, want %v (error: %v)", gotCommit, tt.wantCommit, ag.commitErr)
+			}
+		})
+	}
+}
+
+func boolPointer(value bool) *bool { return &value }
 
 func mustAtoi(t *testing.T, value string) int {
 	t.Helper()
