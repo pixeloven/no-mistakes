@@ -585,6 +585,9 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	if !terminalRunStatus(run.Status) {
 		return blockedPlan(state, StatePipelineOwned, "blocked_recover_run_active", "the run that owns this branch is still active; drive it to completion or abort it first; no files or refs were changed")
 	}
+	if !validFullObjectID(run.HeadSHA) {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserved_head_invalid", fmt.Sprintf("the recorded pipeline head %q is not a valid full object ID; inspect the run record before returning custody; no files or refs were changed", run.HeadSHA))
+	}
 	if run.TerminalHeadVerifiedAt == nil {
 		branch := state.Local.Branch
 		if strings.TrimSpace(s.GateDir) == "" {
@@ -611,9 +614,6 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	branch := state.Local.Branch
 	local := state.Local.Head
 	preserved := run.HeadSHA
-	if !validFullObjectID(preserved) {
-		return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserved_head_invalid", fmt.Sprintf("the recorded pipeline head %q is not a valid full object ID; inspect the run record before returning custody; no files or refs were changed", preserved))
-	}
 	anchorRef := custody.RecoveryRef(run.ID)
 	localAnchor := custody.RecoveryLocalRef(run.ID)
 	gateDir := strings.TrimSpace(s.GateDir)
@@ -1403,7 +1403,7 @@ func exactPushedBinding(repo *db.Repo, run *db.Run, branch string) bool {
 // missing or conflicting evidence leaves the older run authoritative.
 func (s *Service) supersededUnpublishedRun(ctx context.Context, older, newer *db.Run, branch string) bool {
 	if older == nil || newer == nil || !terminalRunStatus(older.Status) || !unpublishedPipelineHead(older) ||
-		!samePushTargetBinding(older, newer) || strings.TrimSpace(s.GateDir) == "" || older.HeadSHA == "" || newer.LastPushedSHA == nil {
+		!samePushTargetBinding(older, newer) || strings.TrimSpace(s.GateDir) == "" || !validFullObjectID(older.HeadSHA) || newer.LastPushedSHA == nil || !validFullObjectID(*newer.LastPushedSHA) {
 		return false
 	}
 	pushed := ptr(newer.LastPushedSHA)
@@ -1439,7 +1439,10 @@ func terminalRunStatus(status types.RunStatus) bool {
 func (s *Service) classifyPipelineOwned(ctx context.Context, state *State, run *db.Run, activeMessage string) {
 	state.State = StatePipelineOwned
 	state.Pipeline.Phase = "pre_push"
-	state.Relation = relationBetween(ctx, s.workDir(), state.Local.Head, run.HeadSHA)
+	state.Relation = RelationUnknown
+	if validFullObjectID(run.HeadSHA) {
+		state.Relation = relationBetween(ctx, s.workDir(), state.Local.Head, run.HeadSHA)
+	}
 	if terminalRunStatus(run.Status) {
 		source := s.recoverySource(ctx, state, run)
 		if source == recoverySourceMissing {
@@ -1527,8 +1530,7 @@ func (s *Service) recoverySource(ctx context.Context, state *State, run *db.Run)
 		// The invoking branch must still be a clean, exact repository context;
 		// an anchor alone must not authorize recovery over dirty or unrelated
 		// divergent local work.
-		if state.Local.Clean && objectExists(ctx, gateDir, local) &&
-			(local == preserved || isAncestor(ctx, gateDir, local, preserved) || preservedContainsLocalWork(ctx, gateDir, local, preserved)) {
+		if state.Local.Clean && gateRecoveryContainsLocalWork(ctx, s.workDir(), gateDir, local, preserved) {
 			return recoverySourceAvailable
 		}
 		return recoverySourceInvalid
@@ -1540,13 +1542,39 @@ func (s *Service) recoverySource(ctx context.Context, state *State, run *db.Run)
 	if !state.Local.Clean {
 		return recoverySourceInvalid
 	}
-	if isAncestor(ctx, gateDir, local, preserved) {
-		return recoverySourceAvailable
-	}
-	if preservedContainsLocalWork(ctx, gateDir, local, preserved) {
+	if gateRecoveryContainsLocalWork(ctx, s.workDir(), gateDir, local, preserved) {
 		return recoverySourceAvailable
 	}
 	return recoverySourceInvalid
+}
+
+func gateRecoveryContainsLocalWork(ctx context.Context, localDir, gateDir, local, preserved string) bool {
+	gateObjects, err := filepath.Abs(filepath.Join(gateDir, "objects"))
+	if err != nil {
+		return false
+	}
+	env := []string{"GIT_ALTERNATE_OBJECT_DIRECTORIES=" + gateObjects}
+	localType, localErr := git.RunWithEnv(ctx, localDir, env, "cat-file", "-t", local)
+	preservedType, preservedErr := git.RunWithEnv(ctx, localDir, env, "cat-file", "-t", preserved)
+	if localErr != nil || preservedErr != nil || localType != "commit" || preservedType != "commit" {
+		return false
+	}
+	if local == preserved {
+		return true
+	}
+	if _, err := git.RunWithEnv(ctx, localDir, env, "merge-base", "--is-ancestor", local, preserved); err == nil {
+		return true
+	}
+	base, err := git.RunWithEnv(ctx, localDir, env, "merge-base", local, preserved)
+	if err != nil || base == "" {
+		return false
+	}
+	mergedTree, err := git.RunWithEnv(ctx, localDir, env, "merge-tree", "--write-tree", "--merge-base", base, preserved, local)
+	if err != nil {
+		return false
+	}
+	preservedTree, err := git.RunWithEnv(ctx, localDir, env, "rev-parse", preserved+"^{tree}")
+	return err == nil && mergedTree == preservedTree
 }
 
 func localRecoveryEligible(ctx context.Context, wd string, state *State, run *db.Run) bool {

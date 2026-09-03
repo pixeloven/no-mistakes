@@ -1004,6 +1004,31 @@ func TestInspectDoesNotTreatRevisionExpressionAsRecordedHead(t *testing.T) {
 	}
 }
 
+func TestRecoverRejectsUnverifiedRevisionExpressionBeforeNormalization(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	corrupt := "refs/heads/feature/recover~1"
+	if err := f.db.UpdateRunStatus(f.run.ID, types.RunCancelled); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, corrupt); err != nil {
+		t.Fatal(err)
+	}
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Safety != "blocked_recover_preserved_head_invalid" {
+		t.Fatalf("unverified corrupt-head recovery = %#v", state)
+	}
+	run, err := f.db.GetRun(f.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.HeadSHA != corrupt || f.custodyReturned() {
+		t.Fatalf("corrupt head was normalized or custody returned: %#v", run)
+	}
+}
+
 func TestInspectDoesNotAdvertiseRecoveryWhenTerminalAnchorConflicts(t *testing.T) {
 	t.Parallel()
 
@@ -1699,6 +1724,42 @@ func TestInspectAdvertisesRecoveryForAnchoredRebasedHead(t *testing.T) {
 	state := f.service.InspectCached(f.ctx)
 	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
 		t.Fatalf("anchored rebased head did not advertise recovery = %#v", state)
+	}
+}
+
+func TestInspectAdvertisesRecoveryWithSplitRebasedObjects(t *testing.T) {
+	t.Parallel()
+
+	for _, anchored := range []bool{false, true} {
+		name := "dangling"
+		if anchored {
+			name = "anchored"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newRebasedRecoverFixture(t, types.RunCancelled)
+			mustRun(t, f.gate, "reflog", "expire", "--expire=now", "--all")
+			mustRun(t, f.gate, "gc", "--prune=now")
+			if _, err := gitpkg.Run(f.ctx, f.gate, "cat-file", "-e", f.submitted); err == nil {
+				t.Fatal("fixture retained the local rebased head in the gate")
+			}
+			if anchored {
+				mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+			}
+			gateMain := mustRun(t, f.gate, "rev-parse", "refs/heads/main")
+			mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", gateMain, f.preserved)
+			if _, err := gitpkg.Run(f.ctx, f.local, "cat-file", "-e", f.preserved); err == nil {
+				t.Fatal("fixture retained the preserved head in the local repository")
+			}
+
+			state := f.service.InspectCached(f.ctx)
+			if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
+				t.Fatalf("split-object state did not advertise recovery = %#v", state)
+			}
+			recovered := f.service.Recover(f.ctx, false)
+			if !recovered.Recovered || !recovered.Changed {
+				t.Fatalf("split-object recovery = %#v", recovered)
+			}
+		})
 	}
 }
 
