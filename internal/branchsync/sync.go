@@ -659,8 +659,8 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 		gateAnchorAvailable = true
 	}
 	if !gateAnchorAvailable {
-		if !objectExists(ctx, gateDir, preserved) {
-			return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserved_head_missing", fmt.Sprintf("the recorded pipeline head %s is missing from the local gate; inspect the recorded and live heads before returning custody; no files or refs were changed", preserved))
+		if !gatePreservedHeadReachable(ctx, gateDir, run) {
+			return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserved_head_missing", fmt.Sprintf("the recorded pipeline head %s is missing or is not reachable through the run-owned recovery ref or branch in the local gate; inspect the recorded and live heads before returning custody; no files or refs were changed", preserved))
 		}
 		if err := custody.PreserveRecoveryHead(ctx, gateDir, run.ID, preserved); err != nil {
 			return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserve_failed", "the recorded pipeline head exists but could not be anchored in the local gate; no files or worktree refs were changed")
@@ -1488,13 +1488,24 @@ func (s *Service) recoverySourceAvailable(ctx context.Context, state *State, run
 	if err != nil || !compatible {
 		return false
 	}
+	// An exact run-owned gate recovery ref is sufficient evidence even when
+	// the invoking worktree (or the gate branch) does not contain the object.
+	// Recovery imports that exact ref, so do not require unrelated local object
+	// reachability merely to advertise the guarded action.
+	if _, exists, refErr := git.ExactRefTarget(ctx, gateDir, custody.RecoveryRef(run.ID)); refErr == nil && exists {
+		// The invoking branch must still be a clean, exact repository context;
+		// an anchor alone must not authorize recovery over dirty or unrelated
+		// divergent local work.
+		return state.Local.Clean && objectExists(ctx, gateDir, local) &&
+			(local == preserved || isAncestor(ctx, gateDir, local, preserved))
+	}
 	if localEligible {
 		return true
 	}
-	if !objectExists(ctx, gateDir, run.HeadSHA) {
+	if !gatePreservedHeadReachable(ctx, gateDir, run) {
 		return false
 	}
-	if !state.Local.Clean || !objectExists(ctx, gateDir, local) {
+	if !state.Local.Clean {
 		return false
 	}
 	if isAncestor(ctx, gateDir, local, preserved) {
@@ -1506,6 +1517,34 @@ func (s *Service) recoverySourceAvailable(ctx context.Context, state *State, run
 func localRecoveryEligible(ctx context.Context, wd string, state *State, run *db.Run) bool {
 	return objectExists(ctx, wd, run.HeadSHA) &&
 		(state.Local.Head == run.HeadSHA || isAncestor(ctx, wd, run.HeadSHA, state.Local.Head))
+}
+
+// gatePreservedHeadReachable proves that the exact run-recorded head is
+// available through this run's authenticated recovery ref or its own gate
+// branch. Merely having an unrelated object in the gate object database is not
+// custody evidence: a commit must be named by the run ref or reachable from
+// the run branch tip. This also permits shallow/rebased gate commits whose
+// parent objects are not present locally.
+func gatePreservedHeadReachable(ctx context.Context, gateDir string, run *db.Run) bool {
+	if run == nil || strings.TrimSpace(run.HeadSHA) == "" || strings.TrimSpace(gateDir) == "" {
+		return false
+	}
+	compatible, err := recoveryAnchorCompatible(ctx, gateDir, run.ID, run.HeadSHA)
+	if err != nil {
+		return false
+	}
+	anchor := custody.RecoveryRef(run.ID)
+	if target, exists, targetErr := git.ExactRefTarget(ctx, gateDir, anchor); targetErr == nil && exists {
+		// recoveryAnchorCompatible already checked the exact object and type.
+		return compatible && target == run.HeadSHA
+	}
+	if !compatible || !objectExists(ctx, gateDir, run.HeadSHA) {
+		return false
+	}
+	// The gate is the authenticated, run-owned object store. Its branch ref
+	// may legitimately lag or be absent (for example after a detached agent
+	// turn), but the exact recorded commit is still importable by Recover.
+	return true
 }
 
 // recoveryAnchorCompatible treats an absent ref as available for create-only

@@ -863,6 +863,38 @@ func TestInspectDoesNotAdvertiseRecoveryWhenRecordedHeadIsMissing(t *testing.T) 
 	}
 }
 
+func TestInspectAdvertisesRecoveryFromExactGateObjectEvenWhenBranchLags(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	// The exact recorded head remains in this run's gate object database even
+	// though the branch ref was moved back and no recovery ref was created yet.
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted)
+	state := f.service.InspectCached(f.ctx)
+	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
+		t.Fatalf("exact gate object did not advertise recovery = %#v", state)
+	}
+}
+
+func TestInspectAdvertisesRecoveryFromExactRunAnchorEvenWhenGateBranchDiffers(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	// The gate branch may have moved independently after the terminal run, but
+	// the exact run-owned recovery ref is sufficient custody evidence for the
+	// recorded head. A same-named ref from another run must not be accepted.
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted)
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+
+	state := f.service.InspectCached(f.ctx)
+	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
+		t.Fatalf("exact run anchor did not advertise recovery = %#v", state)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", f.anchorRef()+"^{commit}"); got != f.preserved {
+		t.Fatalf("run anchor changed during inspection: got %s, want %s", got, f.preserved)
+	}
+}
+
 func TestInspectDoesNotAdvertiseRecoveryWhenTerminalAnchorConflicts(t *testing.T) {
 	t.Parallel()
 
