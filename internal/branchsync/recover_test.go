@@ -1076,6 +1076,26 @@ func TestInspectDoesNotAdvertiseRecoveryWhenTerminalAnchorIsNotACommit(t *testin
 	}
 }
 
+func TestRecoverRejectsPeelableTagRecoveryAnchor(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	mustRun(t, f.gate, "-c", "user.name=No Mistakes Test", "-c", "user.email=test@example.com", "tag", "-a", "-m", "peelable", "peelable", f.preserved)
+	tag := mustRun(t, f.gate, "rev-parse", "refs/tags/peelable^{tag}")
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), tag)
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Safety != "blocked_recover_anchor_mismatch" {
+		t.Fatalf("peelable-tag recovery = %#v", state)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", f.anchorRef()); got != tag {
+		t.Fatalf("peelable-tag anchor changed: got %s, want %s", got, tag)
+	}
+	if f.custodyReturned() {
+		t.Fatal("peelable-tag anchor returned custody")
+	}
+}
+
 func TestInspectDoesNotAdvertiseRecoveryFromLooseObjectWithoutUsableGate(t *testing.T) {
 	t.Parallel()
 

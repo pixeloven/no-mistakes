@@ -652,7 +652,7 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 		return blockedPlan(state, StatePipelineOwned, "blocked_recover_anchor_mismatch", "the run recovery ref could not be inspected; inspect the recorded and live heads before returning custody; no files or refs were changed")
 	}
 	if gateAnchorExists {
-		gateAnchored, err := git.Run(ctx, gateDir, "rev-parse", gateAnchor+"^{commit}")
+		gateAnchored, _, err := git.ExactCommitRefTarget(ctx, gateDir, gateAnchor)
 		if err != nil {
 			return blockedPlan(state, StatePipelineOwned, "blocked_recover_anchor_mismatch", fmt.Sprintf("the run recovery ref points at non-commit object %s instead of the recorded pipeline head %s; inspect both objects before returning custody; no files or refs were changed", gateAnchorTarget, preserved))
 		}
@@ -675,7 +675,7 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	}
 
 	anchored := false
-	if existing, anchorErr := git.Run(ctx, wd, "rev-parse", anchorRef+"^{commit}"); anchorErr == nil && existing == preserved {
+	if existing, exists, anchorErr := git.ExactCommitRefTarget(ctx, wd, anchorRef); anchorErr == nil && exists && existing == preserved {
 		anchored = true
 	}
 	if !anchored {
@@ -985,7 +985,7 @@ func (s *Service) anchorReachablePreserved(ctx context.Context, state State, run
 		return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserve_failed", "the preserved pipeline commits could not be anchored locally; no files or refs were changed"), false
 	}
 	anchorRef := custody.RecoveryRef(runID)
-	if anchored, err := git.Run(ctx, s.workDir(), "rev-parse", anchorRef+"^{commit}"); err != nil || anchored != preserved {
+	if anchored, exists, err := git.ExactCommitRefTarget(ctx, s.workDir(), anchorRef); err != nil || !exists || anchored != preserved {
 		return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserve_failed", "the preserved pipeline commits could not be anchored locally; no files or refs were changed"), false
 	}
 	return State{}, true
@@ -1485,8 +1485,8 @@ func (s *Service) recoverySource(ctx context.Context, state *State, run *db.Run)
 		return recoverySourceInvalid
 	}
 	if localAnchorExists {
-		anchored, err := git.Run(ctx, s.workDir(), "rev-parse", localAnchor+"^{commit}")
-		if err != nil || anchored != run.HeadSHA {
+		anchored, exists, err := git.ExactCommitRefTarget(ctx, s.workDir(), localAnchor)
+		if err != nil || !exists || anchored != run.HeadSHA {
 			return recoverySourceInvalid
 		}
 	} else if target, err := git.Run(ctx, s.workDir(), "symbolic-ref", "-q", localAnchor); err == nil && target != "" {
@@ -1645,22 +1645,18 @@ func recoveryAnchorCompatible(ctx context.Context, repoDir, runID, preserved str
 	if symbolic, err := git.Run(ctx, repoDir, "symbolic-ref", "-q", anchorRef); err == nil && symbolic != "" {
 		return false, nil
 	}
-	target, exists, err := git.ExactRefTarget(ctx, repoDir, anchorRef)
+	target, exists, err := git.ExactCommitRefTarget(ctx, repoDir, anchorRef)
 	if err != nil {
 		return false, err
 	}
 	if !exists {
 		return true, nil
 	}
-	return target == preserved && exactCommitExists(ctx, repoDir, target), nil
+	return target == preserved, nil
 }
 
 func exactCommitExists(ctx context.Context, dir, objectID string) bool {
-	if !validFullObjectID(objectID) {
-		return false
-	}
-	typ, err := git.Run(ctx, dir, "cat-file", "-t", objectID)
-	return err == nil && typ == "commit"
+	return validFullObjectID(objectID) && git.ValidateExactCommit(ctx, dir, objectID) == nil
 }
 
 func validFullObjectID(objectID string) bool {

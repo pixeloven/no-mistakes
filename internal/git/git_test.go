@@ -96,6 +96,39 @@ func TestRunAppliesContextEnvironmentToGitSubprocesses(t *testing.T) {
 	}
 }
 
+func TestFetchRemoteRefRejectsAnnotatedTagTarget(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	remote := t.TempDir()
+	local := t.TempDir()
+	for _, dir := range []string{remote, local} {
+		if _, err := Run(ctx, dir, "init"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Run(ctx, remote, "config", "user.name", "No Mistakes Test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, remote, "config", "user.email", "test@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, remote, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base"); err != nil {
+		t.Fatal(err)
+	}
+	head, err := Run(ctx, remote, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, remote, "tag", "-a", "-m", "peelable", "peelable", head); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := FetchRemoteRef(ctx, local, remote, "refs/tags/peelable", head); err == nil {
+		t.Fatal("annotated tag target was accepted as the exact commit")
+	}
+}
+
 func TestRunError(t *testing.T) {
 	ctx := context.Background()
 	_, err := Run(ctx, t.TempDir(), "log")

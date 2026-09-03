@@ -489,9 +489,12 @@ func FetchRemoteRef(ctx context.Context, dir, remote, remoteRef, expectedCommit 
 	if _, err := Run(ctx, dir, "fetch", "--no-tags", "--no-write-fetch-head", remote, refspec); err != nil {
 		return err
 	}
-	fetched, err := Run(ctx, dir, "rev-parse", "--verify", temporaryRef+"^{commit}")
+	fetched, exists, err := ExactCommitRefTarget(ctx, dir, temporaryRef)
 	if err != nil {
 		return fmt.Errorf("fetched ref %s is not a commit: %w", remoteRef, err)
+	}
+	if !exists {
+		return fmt.Errorf("fetched ref %s is missing", remoteRef)
 	}
 	if fetched != strings.TrimSpace(expectedCommit) {
 		return fmt.Errorf("fetched ref %s moved to %s, expected %s", remoteRef, fetched, expectedCommit)
@@ -884,6 +887,38 @@ func ExactRefTarget(ctx context.Context, dir, ref string) (string, bool, error) 
 		}
 	}
 	return "", false, nil
+}
+
+func ExactCommitRefTarget(ctx context.Context, dir, ref string) (string, bool, error) {
+	if symbolic, err := Run(ctx, dir, "symbolic-ref", "-q", ref); err == nil && symbolic != "" {
+		return "", true, fmt.Errorf("ref %s is symbolic to %s", ref, symbolic)
+	}
+	target, exists, err := ExactRefTarget(ctx, dir, ref)
+	if err != nil || !exists {
+		return target, exists, err
+	}
+	if err := ValidateExactCommit(ctx, dir, target); err != nil {
+		return target, true, err
+	}
+	return target, true, nil
+}
+
+func ValidateExactCommit(ctx context.Context, dir, objectID string) error {
+	resolved, err := Run(ctx, dir, "rev-parse", "--verify", objectID)
+	if err != nil {
+		return err
+	}
+	if resolved != strings.TrimSpace(objectID) {
+		return fmt.Errorf("object %s does not name its exact object ID", objectID)
+	}
+	typ, err := Run(ctx, dir, "cat-file", "-t", objectID)
+	if err != nil {
+		return err
+	}
+	if typ != "commit" {
+		return fmt.Errorf("object %s has type %s, expected commit", objectID, typ)
+	}
+	return nil
 }
 
 // RefExists reports whether the given ref resolves to a commit. It uses
