@@ -585,7 +585,7 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	if !terminalRunStatus(run.Status) {
 		return blockedPlan(state, StatePipelineOwned, "blocked_recover_run_active", "the run that owns this branch is still active; drive it to completion or abort it first; no files or refs were changed")
 	}
-	if !validFullObjectID(run.HeadSHA) {
+	if !validFullObjectIDForRepo(ctx, s.workDir(), run.HeadSHA) {
 		return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserved_head_invalid", fmt.Sprintf("the recorded pipeline head %q is not a valid full object ID; inspect the run record before returning custody; no files or refs were changed", run.HeadSHA))
 	}
 	if run.TerminalHeadVerifiedAt == nil {
@@ -1403,7 +1403,7 @@ func exactPushedBinding(repo *db.Repo, run *db.Run, branch string) bool {
 // missing or conflicting evidence leaves the older run authoritative.
 func (s *Service) supersededUnpublishedRun(ctx context.Context, older, newer *db.Run, branch string) bool {
 	if older == nil || newer == nil || !terminalRunStatus(older.Status) || !unpublishedPipelineHead(older) ||
-		!samePushTargetBinding(older, newer) || strings.TrimSpace(s.GateDir) == "" || !validFullObjectID(older.HeadSHA) || newer.LastPushedSHA == nil || !validFullObjectID(*newer.LastPushedSHA) {
+		!samePushTargetBinding(older, newer) || strings.TrimSpace(s.GateDir) == "" || !validFullObjectIDForRepo(ctx, s.GateDir, older.HeadSHA) || newer.LastPushedSHA == nil || !validFullObjectIDForRepo(ctx, s.GateDir, *newer.LastPushedSHA) {
 		return false
 	}
 	pushed := ptr(newer.LastPushedSHA)
@@ -1440,7 +1440,7 @@ func (s *Service) classifyPipelineOwned(ctx context.Context, state *State, run *
 	state.State = StatePipelineOwned
 	state.Pipeline.Phase = "pre_push"
 	state.Relation = RelationUnknown
-	if validFullObjectID(run.HeadSHA) {
+	if validFullObjectIDForRepo(ctx, s.workDir(), run.HeadSHA) {
 		state.Relation = relationBetween(ctx, s.workDir(), state.Local.Head, run.HeadSHA)
 	}
 	if terminalRunStatus(run.Status) {
@@ -1476,7 +1476,7 @@ const (
 )
 
 func (s *Service) recoverySource(ctx context.Context, state *State, run *db.Run) recoverySourceState {
-	if state == nil || run == nil || !validFullObjectID(run.HeadSHA) {
+	if state == nil || run == nil || !validFullObjectIDForRepo(ctx, s.workDir(), run.HeadSHA) {
 		return recoverySourceInvalid
 	}
 	localAnchor := custody.RecoveryRef(run.ID)
@@ -1608,14 +1608,11 @@ func gatePreservedHeadSource(ctx context.Context, gateDir string, run *db.Run) r
 	if !compatible {
 		return recoverySourceInvalid
 	}
-	if !validFullObjectID(run.HeadSHA) {
-		return recoverySourceInvalid
-	}
-	typ, err := git.Run(ctx, gateDir, "cat-file", "-t", run.HeadSHA)
+	resolved, err := git.Run(ctx, gateDir, "rev-parse", "--verify", run.HeadSHA)
 	if err != nil {
 		return recoverySourceMissing
 	}
-	if typ != "commit" {
+	if resolved != run.HeadSHA || git.ValidateExactCommit(ctx, gateDir, run.HeadSHA) != nil {
 		return recoverySourceInvalid
 	}
 	reachableRefs, err := git.Run(ctx, gateDir, "for-each-ref", "--format=%(refname)", "--contains="+run.HeadSHA)
@@ -1665,6 +1662,24 @@ func validFullObjectID(objectID string) bool {
 	}
 	_, err := hex.DecodeString(objectID)
 	return err == nil && objectID == strings.ToLower(objectID)
+}
+
+func validFullObjectIDForRepo(ctx context.Context, dir, objectID string) bool {
+	if !validFullObjectID(objectID) {
+		return false
+	}
+	format, err := git.Run(ctx, dir, "rev-parse", "--show-object-format")
+	if err != nil {
+		return false
+	}
+	switch format {
+	case "sha1":
+		return len(objectID) == 40
+	case "sha256":
+		return len(objectID) == 64
+	default:
+		return false
+	}
 }
 
 // classifyUserOwned reports a branch released by its terminal outcome: the

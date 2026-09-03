@@ -1004,6 +1004,83 @@ func TestInspectDoesNotTreatRevisionExpressionAsRecordedHead(t *testing.T) {
 	}
 }
 
+func TestInspectRejectsSHA256HeadPrefixAsInvalid(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	local := filepath.Join(root, "local")
+	gate := filepath.Join(root, "gate.git")
+	mustRun(t, root, "init", "--bare", "--object-format=sha256", remote)
+	mustRun(t, root, "init", "--object-format=sha256", "-b", "main", local)
+	configureIdentity(t, local)
+	mustWrite(t, filepath.Join(local, "file.txt"), "base\n")
+	mustRun(t, local, "add", "file.txt")
+	mustRun(t, local, "commit", "-m", "base")
+	base := mustRun(t, local, "rev-parse", "HEAD")
+	mustRun(t, local, "checkout", "-b", "feature/recover")
+	mustWrite(t, filepath.Join(local, "file.txt"), "submitted\n")
+	mustRun(t, local, "commit", "-am", "submitted")
+	submitted := mustRun(t, local, "rev-parse", "HEAD")
+	mustRun(t, root, "init", "--bare", "--object-format=sha256", gate)
+	mustRun(t, local, "push", gate, "refs/heads/feature/recover:refs/heads/feature/recover")
+	pipeline := filepath.Join(root, "pipeline")
+	mustRun(t, root, "clone", gate, pipeline)
+	configureIdentity(t, pipeline)
+	mustRun(t, pipeline, "checkout", "feature/recover")
+	mustWrite(t, filepath.Join(pipeline, "pipeline.txt"), "pipeline\n")
+	mustRun(t, pipeline, "add", "pipeline.txt")
+	mustRun(t, pipeline, "commit", "-m", "pipeline")
+	preserved := mustRun(t, pipeline, "rev-parse", "HEAD")
+	mustRun(t, pipeline, "push", "origin", "HEAD:refs/heads/feature/recover")
+	prefix := preserved[:40]
+
+	database, err := db.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	repo, err := database.InsertRepo(local, remote, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.InsertRun(repo.ID, "feature/recover", submitted, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatusWithVerifiedHead(run.ID, types.RunCancelled, prefix); err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{DB: database, Repo: repo, WorkDir: local, GateDir: gate}
+
+	state := service.InspectCached(ctx)
+	if state.Safety != "blocked_recover_preserved_head_invalid" || state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
+		t.Fatalf("SHA-256 prefix inspection = %#v", state)
+	}
+	recovered := service.Recover(ctx, false)
+	if recovered.Recovered || recovered.Safety != "blocked_recover_preserved_head_invalid" {
+		t.Fatalf("SHA-256 prefix recovery = %#v", recovered)
+	}
+	if err := database.UpdateRunStatus(run.ID, types.RunCancelled); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunHeadSHA(run.ID, prefix); err != nil {
+		t.Fatal(err)
+	}
+	recovered = service.Recover(ctx, false)
+	if recovered.Recovered || recovered.Safety != "blocked_recover_preserved_head_invalid" {
+		t.Fatalf("unverified SHA-256 prefix recovery = %#v", recovered)
+	}
+	stored, err := database.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.HeadSHA != prefix || stored.CustodyReturnedAt != nil {
+		t.Fatalf("SHA-256 prefix was normalized or custody returned: %#v", stored)
+	}
+}
+
 func TestRecoverRejectsUnverifiedRevisionExpressionBeforeNormalization(t *testing.T) {
 	t.Parallel()
 
