@@ -895,6 +895,63 @@ func TestInspectAdvertisesRecoveryFromExactRunAnchorEvenWhenGateBranchDiffers(t 
 	}
 }
 
+func TestInspectDoesNotAdvertiseRecoveryFromAnotherRunsAnchor(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted)
+	mustRun(t, f.gate, "update-ref", custody.RecoveryRef("another-run"), f.preserved)
+
+	state := f.service.InspectCached(f.ctx)
+	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
+		t.Fatalf("foreign-anchor next action = %#v", state.NextAction)
+	}
+}
+
+func TestInspectDoesNotAdvertiseAmbiguousRecoveryOwnership(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	mustRun(t, f.gate, "update-ref", custody.RecoveryRef("another-run"), f.preserved)
+
+	state := f.service.InspectCached(f.ctx)
+	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
+		t.Fatalf("ambiguous-ownership next action = %#v", state.NextAction)
+	}
+}
+
+func TestInspectDoesNotAdvertiseRecoveryFromUnrelatedGateRef(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted)
+	mustRun(t, f.gate, "update-ref", "refs/heads/unrelated", f.preserved)
+
+	state := f.service.InspectCached(f.ctx)
+	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
+		t.Fatalf("unrelated-ref next action = %#v", state.NextAction)
+	}
+}
+
+func TestInspectDoesNotTreatRevisionExpressionAsRecordedHead(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	if err := f.db.UpdateRunStatusWithVerifiedHead(f.run.ID, types.RunCancelled, "HEAD"); err != nil {
+		t.Fatal(err)
+	}
+	f.service.GateDir = ""
+
+	state := f.service.InspectCached(f.ctx)
+	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
+		t.Fatalf("corrupt-record next action = %#v", state.NextAction)
+	}
+	recovered := f.service.Recover(f.ctx, false)
+	if recovered.Recovered || f.custodyReturned() {
+		t.Fatalf("corrupt record recovered custody = %#v", recovered)
+	}
+}
+
 func TestInspectDoesNotAdvertiseRecoveryWhenTerminalAnchorConflicts(t *testing.T) {
 	t.Parallel()
 
@@ -1574,6 +1631,19 @@ func TestRecoverRebasedPreservedHeadAdoptsWithoutEscalating(t *testing.T) {
 	}
 	if !f.custodyReturned() {
 		t.Fatal("custody not stamped")
+	}
+}
+
+func TestInspectAdvertisesRecoveryForAnchoredRebasedHead(t *testing.T) {
+	t.Parallel()
+
+	f := newRebasedRecoverFixture(t, types.RunCancelled)
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+
+	state := f.service.InspectCached(f.ctx)
+	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
+		t.Fatalf("anchored rebased head did not advertise recovery = %#v", state)
 	}
 }
 

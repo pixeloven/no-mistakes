@@ -611,6 +611,9 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	branch := state.Local.Branch
 	local := state.Local.Head
 	preserved := run.HeadSHA
+	if !validFullObjectID(preserved) {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserved_head_missing", fmt.Sprintf("the recorded pipeline head %q is not a valid full object ID; inspect the run record before returning custody; no files or refs were changed", preserved))
+	}
 	anchorRef := custody.RecoveryRef(run.ID)
 	localAnchor := custody.RecoveryLocalRef(run.ID)
 	gateDir := strings.TrimSpace(s.GateDir)
@@ -1451,7 +1454,7 @@ func (s *Service) classifyPipelineOwned(ctx context.Context, state *State, run *
 }
 
 func (s *Service) recoverySourceAvailable(ctx context.Context, state *State, run *db.Run) bool {
-	if state == nil || run == nil || strings.TrimSpace(run.HeadSHA) == "" {
+	if state == nil || run == nil || !validFullObjectID(run.HeadSHA) {
 		return false
 	}
 	localAnchor := custody.RecoveryRef(run.ID)
@@ -1497,7 +1500,7 @@ func (s *Service) recoverySourceAvailable(ctx context.Context, state *State, run
 		// an anchor alone must not authorize recovery over dirty or unrelated
 		// divergent local work.
 		return state.Local.Clean && objectExists(ctx, gateDir, local) &&
-			(local == preserved || isAncestor(ctx, gateDir, local, preserved))
+			(local == preserved || isAncestor(ctx, gateDir, local, preserved) || preservedContainsLocalWork(ctx, gateDir, local, preserved))
 	}
 	if localEligible {
 		return true
@@ -1515,18 +1518,19 @@ func (s *Service) recoverySourceAvailable(ctx context.Context, state *State, run
 }
 
 func localRecoveryEligible(ctx context.Context, wd string, state *State, run *db.Run) bool {
-	return objectExists(ctx, wd, run.HeadSHA) &&
+	return exactCommitExists(ctx, wd, run.HeadSHA) &&
 		(state.Local.Head == run.HeadSHA || isAncestor(ctx, wd, run.HeadSHA, state.Local.Head))
 }
 
 // gatePreservedHeadReachable proves that the exact run-recorded head is
-// available through this run's authenticated recovery ref or its own gate
-// branch. Merely having an unrelated object in the gate object database is not
-// custody evidence: a commit must be named by the run ref or reachable from
-// the run branch tip. This also permits shallow/rebased gate commits whose
-// parent objects are not present locally.
+// available without conflicting ownership evidence in the authenticated gate.
+// A direct run anchor or exact run branch is sufficient; a legacy dangling
+// object is sufficient only when no foreign ref reaches it.
 func gatePreservedHeadReachable(ctx context.Context, gateDir string, run *db.Run) bool {
 	if run == nil || strings.TrimSpace(run.HeadSHA) == "" || strings.TrimSpace(gateDir) == "" {
+		return false
+	}
+	if !exactCommitExists(ctx, gateDir, run.HeadSHA) {
 		return false
 	}
 	compatible, err := recoveryAnchorCompatible(ctx, gateDir, run.ID, run.HeadSHA)
@@ -1538,19 +1542,32 @@ func gatePreservedHeadReachable(ctx context.Context, gateDir string, run *db.Run
 		// recoveryAnchorCompatible already checked the exact object and type.
 		return compatible && target == run.HeadSHA
 	}
-	if !compatible || !objectExists(ctx, gateDir, run.HeadSHA) {
+	if !compatible {
 		return false
 	}
-	// The gate is the authenticated, run-owned object store. Its branch ref
-	// may legitimately lag or be absent (for example after a detached agent
-	// turn), but the exact recorded commit is still importable by Recover.
-	return true
+	reachableRefs, err := git.Run(ctx, gateDir, "for-each-ref", "--format=%(refname)", "--contains="+run.HeadSHA)
+	if err != nil {
+		return false
+	}
+	refs := strings.Fields(reachableRefs)
+	if len(refs) == 0 {
+		return true
+	}
+	branchRef := "refs/heads/" + run.Branch
+	if len(refs) != 1 || refs[0] != branchRef {
+		return false
+	}
+	target, exists, err := git.ExactRefTarget(ctx, gateDir, branchRef)
+	return err == nil && exists && target == run.HeadSHA
 }
 
 // recoveryAnchorCompatible treats an absent ref as available for create-only
 // preservation, but rejects every existing ref that is not exactly the
 // recorded commit, including symbolic and non-commit evidence.
 func recoveryAnchorCompatible(ctx context.Context, repoDir, runID, preserved string) (bool, error) {
+	if !exactCommitExists(ctx, repoDir, preserved) {
+		return false, nil
+	}
 	anchorRef := custody.RecoveryRef(runID)
 	if symbolic, err := git.Run(ctx, repoDir, "symbolic-ref", "-q", anchorRef); err == nil && symbolic != "" {
 		return false, nil
@@ -1564,6 +1581,22 @@ func recoveryAnchorCompatible(ctx context.Context, repoDir, runID, preserved str
 	}
 	anchored, err := git.Run(ctx, repoDir, "rev-parse", anchorRef+"^{commit}")
 	return err == nil && anchored == preserved, nil
+}
+
+func exactCommitExists(ctx context.Context, dir, objectID string) bool {
+	if !validFullObjectID(objectID) {
+		return false
+	}
+	typ, err := git.Run(ctx, dir, "cat-file", "-t", objectID)
+	return err == nil && typ == "commit"
+}
+
+func validFullObjectID(objectID string) bool {
+	if len(objectID) != 40 && len(objectID) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(objectID)
+	return err == nil && objectID == strings.ToLower(objectID)
 }
 
 // classifyUserOwned reports a branch released by its terminal outcome: the
