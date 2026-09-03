@@ -895,6 +895,46 @@ func TestInspectAdvertisesRecoveryFromExactRunAnchorEvenWhenGateBranchDiffers(t 
 	}
 }
 
+func TestInspectAdvertisesRecoveryForLocalAheadWithGateAnchor(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	mustRun(t, f.local, "fetch", f.gate, f.preserved)
+	mustRun(t, f.local, "merge", "--ff-only", f.preserved)
+	mustWrite(t, filepath.Join(f.local, "operator.txt"), "operator follow-up\n")
+	mustRun(t, f.local, "add", "operator.txt")
+	mustRun(t, f.local, "commit", "-m", "operator follow-up")
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+
+	state := f.service.InspectCached(f.ctx)
+	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
+		t.Fatalf("local-ahead anchored state did not advertise recovery = %#v", state)
+	}
+}
+
+func TestInspectUsesLocalRecoveryWhenUnanchoredGateObjectWasPruned(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	mustRun(t, f.local, "fetch", f.gate, f.preserved)
+	mustRun(t, f.local, "merge", "--ff-only", f.preserved)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+	mustRun(t, f.gate, "reflog", "expire", "--expire=now", "--all")
+	mustRun(t, f.gate, "gc", "--prune=now")
+	if _, err := gitpkg.Run(f.ctx, f.gate, "cat-file", "-e", f.preserved); err == nil {
+		t.Fatal("fixture did not prune the preserved object from the gate")
+	}
+
+	state := f.service.InspectCached(f.ctx)
+	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
+		t.Fatalf("local-only preserved head did not advertise recovery = %#v", state)
+	}
+	recovered := f.service.Recover(f.ctx, false)
+	if !recovered.Recovered || recovered.Changed {
+		t.Fatalf("local-only recovery = %#v", recovered)
+	}
+}
+
 func TestInspectDoesNotAdvertiseRecoveryFromAnotherRunsAnchor(t *testing.T) {
 	t.Parallel()
 
@@ -903,6 +943,9 @@ func TestInspectDoesNotAdvertiseRecoveryFromAnotherRunsAnchor(t *testing.T) {
 	mustRun(t, f.gate, "update-ref", custody.RecoveryRef("another-run"), f.preserved)
 
 	state := f.service.InspectCached(f.ctx)
+	if state.Safety != "blocked_recover_preserved_head_invalid" {
+		t.Fatalf("foreign-anchor safety = %q", state.Safety)
+	}
 	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
 		t.Fatalf("foreign-anchor next action = %#v", state.NextAction)
 	}
@@ -915,6 +958,9 @@ func TestInspectDoesNotAdvertiseAmbiguousRecoveryOwnership(t *testing.T) {
 	mustRun(t, f.gate, "update-ref", custody.RecoveryRef("another-run"), f.preserved)
 
 	state := f.service.InspectCached(f.ctx)
+	if state.Safety != "blocked_recover_preserved_head_invalid" {
+		t.Fatalf("ambiguous-ownership safety = %q", state.Safety)
+	}
 	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
 		t.Fatalf("ambiguous-ownership next action = %#v", state.NextAction)
 	}
@@ -928,6 +974,9 @@ func TestInspectDoesNotAdvertiseRecoveryFromUnrelatedGateRef(t *testing.T) {
 	mustRun(t, f.gate, "update-ref", "refs/heads/unrelated", f.preserved)
 
 	state := f.service.InspectCached(f.ctx)
+	if state.Safety != "blocked_recover_preserved_head_invalid" {
+		t.Fatalf("unrelated-ref safety = %q", state.Safety)
+	}
 	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
 		t.Fatalf("unrelated-ref next action = %#v", state.NextAction)
 	}
@@ -943,6 +992,9 @@ func TestInspectDoesNotTreatRevisionExpressionAsRecordedHead(t *testing.T) {
 	f.service.GateDir = ""
 
 	state := f.service.InspectCached(f.ctx)
+	if state.Safety != "blocked_recover_preserved_head_invalid" {
+		t.Fatalf("corrupt-record safety = %q", state.Safety)
+	}
 	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
 		t.Fatalf("corrupt-record next action = %#v", state.NextAction)
 	}
@@ -963,8 +1015,8 @@ func TestInspectDoesNotAdvertiseRecoveryWhenTerminalAnchorConflicts(t *testing.T
 	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.submitted)
 
 	state := f.service.InspectCached(f.ctx)
-	if state.Safety != "blocked_recover_preserved_head_missing" {
-		t.Fatalf("conflicting-anchor safety = %q, want blocked_recover_preserved_head_missing: %#v", state.Safety, state)
+	if state.Safety != "blocked_recover_preserved_head_invalid" {
+		t.Fatalf("conflicting-anchor safety = %q, want blocked_recover_preserved_head_invalid: %#v", state.Safety, state)
 	}
 	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
 		t.Fatalf("conflicting-anchor next action = %#v", state.NextAction)
@@ -985,6 +1037,9 @@ func TestInspectDoesNotAdvertiseRecoveryWhenTerminalAnchorIsNotACommit(t *testin
 	mustRun(t, f.gate, "update-ref", f.anchorRef(), blob)
 
 	state := f.service.InspectCached(f.ctx)
+	if state.Safety != "blocked_recover_preserved_head_invalid" {
+		t.Fatalf("non-commit-anchor safety = %q", state.Safety)
+	}
 	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
 		t.Fatalf("non-commit-anchor next action = %#v", state.NextAction)
 	}
