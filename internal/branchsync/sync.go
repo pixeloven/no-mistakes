@@ -542,9 +542,11 @@ func (s *Service) Apply(ctx context.Context) State {
 //     private anchor ref refs/no-mistakes/recover/<runID> locally without
 //     requiring gate access, but rejects a conflicting recovery ref when the
 //     gate is available; otherwise the preserved head is verified through the
-//     gate's run-specific recovery ref and fetched into that anchor. Legacy terminal
-//     heads that still exist as unreferenced gate objects are anchored before
-//     recovery continues. The branch ref may independently lag or advance.
+//     gate's run-specific recovery ref and fetched into that anchor. A legacy
+//     terminal head without that ref may be anchored only when the exact commit
+//     has unambiguous ownership evidence in the gate: no containing ref, or only
+//     the recorded branch pointing exactly at it. The branch ref may independently
+//     lag or advance when the run-specific recovery ref exists.
 //   - The only possible worktree mutation is a guarded move of a clean checked-out
 //     branch: a strict fast-forward, or an anchored move to a proven-containing
 //     head performed by Git operations that refuse on their own rather than by a
@@ -1612,7 +1614,18 @@ func gatePreservedHeadSource(ctx context.Context, gateDir string, run *db.Run) r
 	if err != nil {
 		return recoverySourceMissing
 	}
-	if resolved != run.HeadSHA || git.ValidateExactCommit(ctx, gateDir, run.HeadSHA) != nil {
+	if resolved != run.HeadSHA {
+		return recoverySourceInvalid
+	}
+	typ, err := git.Run(ctx, gateDir, "cat-file", "-t", run.HeadSHA)
+	if err != nil {
+		// rev-parse echoes a syntactically valid full object ID even when the
+		// object is absent. Keep that case distinct from an object that exists
+		// with an invalid type so the operator gets actionable missing-head
+		// guidance.
+		return recoverySourceMissing
+	}
+	if typ != "commit" {
 		return recoverySourceInvalid
 	}
 	reachableRefs, err := git.Run(ctx, gateDir, "for-each-ref", "--format=%(refname)", "--contains="+run.HeadSHA)
