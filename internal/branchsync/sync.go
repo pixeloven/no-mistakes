@@ -1510,6 +1510,9 @@ func (s *Service) recoverySource(ctx context.Context, state *State, run *db.Run)
 		if localEligible {
 			return recoverySourceAvailable
 		}
+		if !localPreservedPresent {
+			return recoverySourceMissing
+		}
 		return recoverySourceInvalid
 	}
 	if _, err := os.Stat(gateDir); err != nil {
@@ -1640,11 +1643,7 @@ func gatePreservedHeadSource(ctx context.Context, gateDir string, run *db.Run) r
 	if len(refs) != 1 || refs[0] != branchRef {
 		return recoverySourceInvalid
 	}
-	target, exists, err := git.ExactRefTarget(ctx, gateDir, branchRef)
-	if err == nil && exists && target == run.HeadSHA {
-		return recoverySourceAvailable
-	}
-	return recoverySourceInvalid
+	return recoverySourceAvailable
 }
 
 // recoveryAnchorCompatible treats an absent ref as available for create-only
