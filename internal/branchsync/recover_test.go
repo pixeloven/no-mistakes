@@ -1084,11 +1084,33 @@ func TestInspectDoesNotAdvertiseRecoveryFromLooseObjectWithoutUsableGate(t *test
 	f.service.GateDir = filepath.Join(t.TempDir(), "missing-gate.git")
 
 	state := f.service.InspectCached(f.ctx)
+	if state.Safety != "blocked_recover_preserved_head_invalid" {
+		t.Fatalf("unavailable-gate safety = %q", state.Safety)
+	}
 	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
 		t.Fatalf("loose-object-only next action = %#v", state.NextAction)
 	}
 	if state.NextAction.Code == "recover_custody" {
 		t.Fatal("a locally present object advertised recovery even though the behind branch still requires gate evidence")
+	}
+}
+
+func TestInspectDoesNotLabelLocallyPresentDivergedHeadMissing(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	mustRun(t, f.local, "fetch", f.gate, f.preserved)
+	mustWrite(t, filepath.Join(f.local, "diverged.txt"), "diverged\n")
+	mustRun(t, f.local, "add", "diverged.txt")
+	mustRun(t, f.local, "commit", "-m", "diverged")
+	f.service.GateDir = ""
+
+	state := f.service.InspectCached(f.ctx)
+	if state.Safety != "blocked_recover_preserved_head_invalid" {
+		t.Fatalf("locally-present divergence safety = %q", state.Safety)
+	}
+	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
+		t.Fatalf("locally-present divergence next action = %#v", state.NextAction)
 	}
 }
 

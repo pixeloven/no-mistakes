@@ -1494,6 +1494,7 @@ func (s *Service) recoverySource(ctx context.Context, state *State, run *db.Run)
 	}
 	local := state.Local.Head
 	preserved := run.HeadSHA
+	localPreservedPresent := exactCommitExists(ctx, s.workDir(), preserved)
 	localEligible := localRecoveryEligible(ctx, s.workDir(), state, run)
 	if localEligible {
 		localPreRecovery := custody.RecoveryLocalRef(run.ID)
@@ -1507,13 +1508,13 @@ func (s *Service) recoverySource(ctx context.Context, state *State, run *db.Run)
 		if localEligible {
 			return recoverySourceAvailable
 		}
-		return recoverySourceMissing
+		return recoverySourceInvalid
 	}
 	if _, err := os.Stat(gateDir); err != nil {
 		if localEligible {
 			return recoverySourceAvailable
 		}
-		return recoverySourceMissing
+		return recoverySourceInvalid
 	}
 	compatible, err := recoveryAnchorCompatible(ctx, gateDir, run.ID, preserved)
 	if err != nil || !compatible {
@@ -1537,6 +1538,9 @@ func (s *Service) recoverySource(ctx context.Context, state *State, run *db.Run)
 	}
 	gateSource := gatePreservedHeadSource(ctx, gateDir, run)
 	if gateSource != recoverySourceAvailable {
+		if gateSource == recoverySourceMissing && localPreservedPresent {
+			return recoverySourceInvalid
+		}
 		return gateSource
 	}
 	if !state.Local.Clean {
