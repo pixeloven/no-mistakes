@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.60.3](https://github.com/pixeloven/no-mistakes/compare/v1.60.2...v1.60.3) (2026-09-04)
+
+
+### Bug Fixes
+
+* honor explicit local commit signing policy ([7fe829f](https://github.com/pixeloven/no-mistakes/commit/7fe829ffdff6e3e69debaeeb7fa90aa1fa32a7dd))
+* reject stale shared signing configuration ([75d813e](https://github.com/pixeloven/no-mistakes/commit/75d813efde333bd26304401e2f2db947427b2897))
+
 ## [1.60.2](https://github.com/pixeloven/no-mistakes/compare/v1.60.1...v1.60.2) (2026-08-31)
 
 
