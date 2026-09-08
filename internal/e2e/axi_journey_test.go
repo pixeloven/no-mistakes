@@ -518,6 +518,102 @@ func rebaseCustodyScenario(t *testing.T) string {
 	return path
 }
 
+// TestAxiFailedShutdownRecoveryStartsOneFreshRun reproduces the complete
+// operator path with an isolated daemon. The first run is interrupted while
+// parked after its detached worktree rebased the branch. Shutdown preserves
+// that unpublished head without moving the gate branch, recovery adopts it,
+// and one later authorized axi run must start from the recovered head rather
+// than fail non-fast-forward or re-report the prior daemon-shutdown error.
+func TestAxiFailedShutdownRecoveryStartsOneFreshRun(t *testing.T) {
+	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: rebaseCustodyScenario(t)})
+	h.CommitChange("init-shutdown-recover", "seed.txt", "seed\n", "seed shutdown recovery init")
+	initWorktree := h.AddWorktree("init-shutdown-recover")
+	if out, err := h.RunInDir(initWorktree, "init"); err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+
+	branch := "feature/shutdown-recover"
+	submitted := h.CommitChange(branch, "feature.txt", "unsafe\n", "add shutdown recovery feature")
+	h.CommitChange("main", "upstream-advance.txt", "advance\n", "upstream advance")
+	if out, err := h.runGit(context.Background(), h.WorkDir, "push", "origin", "main"); err != nil {
+		t.Fatalf("advance upstream main: %v\n%s", err, out)
+	}
+
+	operator := h.AddWorktree(branch)
+	gateOut, err := h.RunInDir(operator, "axi", "run", "--intent", "preserve and validate the rebased delivery across daemon shutdown")
+	if err != nil || !strings.Contains(gateOut, "rebase-1") {
+		t.Fatalf("initial review gate: %v\n%s", err, gateOut)
+	}
+	prior := h.ActiveRun(branch)
+	if prior == nil {
+		t.Fatal("initial run was not active at the review gate")
+	}
+
+	stopOut, stopErr := h.RunInDir(operator, "daemon", "stop", "--force")
+	if stopErr != nil || !strings.Contains(stopOut, "daemon stopped") {
+		t.Fatalf("stop isolated daemon: %v\n%s", stopErr, stopOut)
+	}
+
+	gateDir := filepath.Join(h.NMHome, "repos", h.repoID()+".git")
+	anchorRef := "refs/no-mistakes/recover/" + prior.ID
+	preservedBytes, gitErr := h.runGit(context.Background(), gateDir, "rev-parse", anchorRef+"^{commit}")
+	if gitErr != nil {
+		t.Fatalf("resolve shutdown-preserved head: %v\n%s", gitErr, preservedBytes)
+	}
+	preserved := strings.TrimSpace(string(preservedBytes))
+	if preserved == submitted {
+		t.Fatal("shutdown fixture did not preserve the detached rebased head")
+	}
+	if got, gitErr := h.runGit(context.Background(), gateDir, "rev-parse", "refs/heads/"+branch); gitErr != nil || strings.TrimSpace(string(got)) != submitted {
+		t.Fatalf("shutdown gate head = %s (err %v), want submitted %s", strings.TrimSpace(string(got)), gitErr, submitted)
+	}
+
+	recoverOut, recoverErr := h.RunInDir(operator, "axi", "sync", "--recover")
+	if recoverErr != nil {
+		t.Fatalf("recover shutdown-preserved head: %v\n%s", recoverErr, recoverOut)
+	}
+	for _, want := range []string{"recovered: true", "state: custody_returned", "changed: true"} {
+		if !strings.Contains(recoverOut, want) {
+			t.Errorf("shutdown recovery missing %q:\n%s", want, recoverOut)
+		}
+	}
+	if got, gitErr := h.runGit(context.Background(), operator, "rev-parse", "HEAD"); gitErr != nil || strings.TrimSpace(string(got)) != preserved {
+		t.Fatalf("recovered local HEAD = %s (err %v), want %s", strings.TrimSpace(string(got)), gitErr, preserved)
+	}
+
+	// The recovered head is exactly the old failed run's head. This makes the
+	// stale-error hazard load-bearing: the new run must have a distinct ID and
+	// no inherited terminal error even though both runs began at the same SHA.
+	freshOut, freshErr := h.RunInDir(operator, "axi", "run", "--intent", "validate the recovered rebased delivery")
+	if freshErr != nil {
+		t.Fatalf("fresh run after shutdown recovery: %v\n%s", freshErr, freshOut)
+	}
+	if !strings.Contains(freshOut, "gate:") || strings.Contains(freshOut, "daemon shutting down") || strings.Contains(freshOut, "non-fast-forward") {
+		t.Fatalf("fresh run reported stale terminal state or gate divergence:\n%s", freshOut)
+	}
+	if got, gitErr := h.runGit(context.Background(), gateDir, "rev-parse", "refs/heads/"+branch); gitErr != nil || strings.TrimSpace(string(got)) != preserved {
+		t.Fatalf("reconciled gate head = %s (err %v), want recovered %s", strings.TrimSpace(string(got)), gitErr, preserved)
+	}
+
+	var branchRuns []ipc.RunInfo
+	for _, run := range h.Runs() {
+		if run.Branch == branch {
+			branchRuns = append(branchRuns, run)
+		}
+	}
+	if len(branchRuns) != 2 {
+		t.Fatalf("runs on %s = %d, want the failed run plus exactly one authorized retry: %#v", branch, len(branchRuns), branchRuns)
+	}
+	fresh := h.ActiveRun(branch)
+	if fresh == nil || fresh.ID == prior.ID || fresh.HeadSHA != preserved || fresh.Error != nil {
+		t.Fatalf("fresh run identity/health = %#v, prior = %#v", fresh, prior)
+	}
+	failed := h.RunInfo(prior.ID)
+	if failed == nil || failed.Status != types.RunFailed || failed.Error == nil || *failed.Error != "daemon shutting down" {
+		t.Fatalf("prior terminal history = %#v, want failed daemon-shutdown record", failed)
+	}
+}
+
 // TestAxiCustodyRecoveryAfterRebaseJourney is the same cancelled-validation
 // custody return, in the shape that used to over-escalate: the default branch
 // advanced before the run, so the pipeline's own rebase step replayed the
