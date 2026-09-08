@@ -31,7 +31,9 @@ func newSyncCmd() *cobra.Command {
 			"--recover returns custody of a branch whose run went terminal with unpublished\n" +
 			"pipeline commits: it anchors the preserved head, then either fast-forwards a\n" +
 			"clean behind worktree or adopts a diverged preserved head only when proven to\n" +
-			"carry every local change. Unproven divergence refuses. A run cancelled before\n" +
+			"carry every local change. Before custody returns, an available internal gate\n" +
+			"branch is also reconciled to that recovered head only when proven safe.\n" +
+			"Unproven divergence refuses. A run cancelled before\n" +
 			"the pipeline changed anything releases the branch by itself (user_owned) and\n" +
 			"makes --recover a no-op. --recover --keep-local keeps the current local head\n" +
 			"instead and never touches the worktree.",
@@ -72,7 +74,8 @@ func newAxiSyncCmd() *cobra.Command {
 			"verified pipeline head with reset semantics.\n" +
 			"--check performs the same fresh read-only plan. Blocked states change nothing.\n" +
 			"--recover performs the guarded custody return offered by\n" +
-			"next_action.code: recover_custody; --keep-local keeps the current local head.",
+			"next_action.code: recover_custody, including safe internal-gate reconciliation;\n" +
+			"--keep-local keeps the current local head.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -215,9 +218,11 @@ func runHumanRecover(cmd *cobra.Command, keepLocal, yes bool) error {
 			fmt.Fprintln(cmd.OutOrStdout(), "  possible changes are anchoring the preserved pipeline commits and moving the")
 			fmt.Fprintln(cmd.OutOrStdout(), "  local gate branch to your current head; the worktree is never touched.")
 		} else {
-			fmt.Fprintln(cmd.OutOrStdout(), "  possible worktree change is a fast-forward of this clean behind branch, or")
+			fmt.Fprintln(cmd.OutOrStdout(), "  possible changes are safe reconciliation of the local gate branch plus either")
+			fmt.Fprintln(cmd.OutOrStdout(), "  a fast-forward of this clean behind branch, or")
 			fmt.Fprintln(cmd.OutOrStdout(), "  adoption of a diverged preserved head proven to carry every local change;")
-			fmt.Fprintln(cmd.OutOrStdout(), "  unproven divergence refuses, and --keep-local keeps the current head.")
+			fmt.Fprintln(cmd.OutOrStdout(), "  every replaced head stays anchored, unproven divergence refuses, and")
+			fmt.Fprintln(cmd.OutOrStdout(), "  --keep-local keeps the current head.")
 		}
 		fmt.Fprint(cmd.OutOrStdout(), "  Return custody of this branch? [y/N] ")
 		line, readErr := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')

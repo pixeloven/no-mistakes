@@ -512,14 +512,17 @@ func TestRecoverGateDivergenceAndUnavailabilityFailClosed(t *testing.T) {
 		mustRun(t, writer, "push", "origin", "HEAD:refs/heads/feature/recover")
 		movedGate := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover")
 		state := f.service.Recover(f.ctx, false)
-		if !state.Recovered || !state.Changed {
-			t.Fatalf("recover with moved gate = %#v", state)
+		if state.Recovered || state.Changed || state.Safety != "blocked_recover_gate_diverged" {
+			t.Fatalf("recover with independently advanced gate = %#v", state)
 		}
-		if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
-			t.Fatalf("moved-gate recovery HEAD = %s, want %s", got, f.preserved)
+		if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+			t.Fatalf("unsafe gate refusal moved local HEAD = %s, want %s", got, f.submitted)
 		}
 		if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != movedGate {
-			t.Fatalf("recovery rewrote independent gate head = %s, want %s", got, movedGate)
+			t.Fatalf("unsafe recovery rewrote independent gate head = %s, want %s", got, movedGate)
+		}
+		if f.custodyReturned() {
+			t.Fatal("unsafe gate relationship stamped custody")
 		}
 	})
 	t.Run("gate branch deleted with recovery ref", func(t *testing.T) {
@@ -532,6 +535,9 @@ func TestRecoverGateDivergenceAndUnavailabilityFailClosed(t *testing.T) {
 		}
 		if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
 			t.Fatalf("recovered HEAD = %s, want %s", got, f.preserved)
+		}
+		if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+			t.Fatalf("recovery did not recreate gate branch at preserved head: got %s, want %s", got, f.preserved)
 		}
 	})
 	t.Run("gate missing", func(t *testing.T) {
@@ -839,6 +845,9 @@ func TestRecoverUsesTerminalAnchorWhenGateBranchLags(t *testing.T) {
 	}
 	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
 		t.Fatalf("recovered HEAD = %s, want %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("recovered gate branch = %s, want %s", got, f.preserved)
 	}
 }
 
@@ -1830,6 +1839,105 @@ func TestRecoverRebasedPreservedHeadAdoptsWithoutEscalating(t *testing.T) {
 	}
 	if !f.custodyReturned() {
 		t.Fatal("custody not stamped")
+	}
+}
+
+// TestRecoverRebasedPreservedHeadReconcilesSubmittedGate models shutdown
+// terminalization: the detached run worktree reached a safely rebased head,
+// but the gate branch itself still points at the submitted head. Recovery must
+// settle both refs before returning custody; otherwise the next ordinary push
+// of the recovered branch is rejected as a non-fast-forward.
+func TestRecoverRebasedPreservedHeadReconcilesSubmittedGate(t *testing.T) {
+	t.Parallel()
+
+	f := newRebasedRecoverFixture(t, types.RunFailed)
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+
+	state := f.service.Recover(f.ctx, false)
+	if !state.Recovered || !state.Changed || state.State != StateCustodyReturned {
+		t.Fatalf("shutdown recovery = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("recovered local branch = %s, want %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("reconciled gate branch = %s, want %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryGateRef(f.run.ID)); got != f.submitted {
+		t.Fatalf("pre-recovery gate head = %s, want submitted %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.localAnchorRef()); got != f.submitted {
+		t.Fatalf("pre-recovery local head = %s, want submitted %s", got, f.submitted)
+	}
+}
+
+func TestRecoverRebasedPreservedHeadRefusesConflictingGateEvidence(t *testing.T) {
+	t.Parallel()
+
+	f := newRebasedRecoverFixture(t, types.RunFailed)
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+	mustRun(t, f.gate, "update-ref", custody.RecoveryGateRef(f.run.ID), f.base)
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Changed || state.Safety != "blocked_recover_gate_evidence" {
+		t.Fatalf("conflicting gate evidence recovery = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("conflicting evidence moved local HEAD = %s, want %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+		t.Fatalf("conflicting evidence moved gate branch = %s, want %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryGateRef(f.run.ID)); got != f.base {
+		t.Fatalf("conflicting evidence was overwritten: got %s, want %s", got, f.base)
+	}
+	if f.custodyReturned() {
+		t.Fatal("conflicting gate evidence stamped custody")
+	}
+}
+
+func TestRecoverRebasedPreservedHeadLosesGateRaceWithoutLosingWork(t *testing.T) {
+	t.Parallel()
+
+	f := newRebasedRecoverFixture(t, types.RunFailed)
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+	var racingHead string
+	f.service.beforeGateReset = func() {
+		writer := filepath.Join(t.TempDir(), "gate-racer")
+		mustRun(t, filepath.Dir(writer), "-c", "core.autocrlf=false", "clone", f.gate, writer)
+		configureIdentity(t, writer)
+		mustRun(t, writer, "checkout", "feature/recover")
+		mustWrite(t, filepath.Join(writer, "racing.txt"), "concurrent gate work\n")
+		mustRun(t, writer, "add", "racing.txt")
+		mustRun(t, writer, "commit", "-m", "concurrent gate work")
+		racingHead = mustRun(t, writer, "rev-parse", "HEAD")
+		mustRun(t, writer, "push", "origin", "HEAD:refs/heads/feature/recover")
+	}
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || !state.Changed || state.Safety != "blocked_recover_gate_race" {
+		t.Fatalf("racing gate recovery = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("safely adopted local head = %s, want %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != racingHead {
+		t.Fatalf("gate race was overwritten: got %s, want %s", got, racingHead)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.localAnchorRef()); got != f.submitted {
+		t.Fatalf("pre-recovery local work was not anchored: got %s, want %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryGateRef(f.run.ID)); got != f.submitted {
+		t.Fatalf("pre-race gate head was not anchored: got %s, want %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", f.anchorRef()); got != f.preserved {
+		t.Fatalf("pipeline head was not preserved: got %s, want %s", got, f.preserved)
+	}
+	if f.custodyReturned() {
+		t.Fatal("racing gate update stamped custody")
 	}
 }
 
