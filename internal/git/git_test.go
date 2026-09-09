@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -338,6 +339,47 @@ func TestCaptureCommitSigningPolicyRejectsSharedLocalValueForUnset(t *testing.T)
 	}
 }
 
+func TestCaptureRunCommitSigningPolicyIsReadOnlyAndRunScoped(t *testing.T) {
+	ctx := context.Background()
+	repo := initTestRepo(t)
+	run(t, repo, "git", "config", "--local", "extensions.worktreeConfig", "false")
+	run(t, repo, "git", "config", "--local", "commit.gpgsign", "true")
+
+	policy, effective, err := CaptureRunCommitSigningPolicy(ctx, repo, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy != "false" || effective == nil || *effective {
+		t.Fatalf("unsigned capture = policy %q effective %v", policy, effective)
+	}
+	if got := run(t, repo, "git", "config", "--local", "--bool", "--get", "commit.gpgsign"); got != "true" {
+		t.Fatalf("unsigned capture mutated persistent policy to %q", got)
+	}
+
+	policy, effective, err = CaptureRunCommitSigningPolicy(ctx, repo, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy != "true" || effective == nil || !*effective {
+		t.Fatalf("default capture = policy %q effective %v, want preserved signer", policy, effective)
+	}
+}
+
+func TestCopyLocalUserIdentityDoesNotCopySigningConfiguration(t *testing.T) {
+	ctx := context.Background()
+	src := initTestRepo(t)
+	dst := initTestRepo(t)
+	run(t, dst, "git", "config", "extensions.worktreeConfig", "true")
+	run(t, src, "git", "config", "--local", "commit.gpgsign", "false")
+	run(t, dst, "git", "config", "--worktree", "commit.gpgsign", "true")
+	if err := CopyLocalUserIdentity(ctx, src, dst); err != nil {
+		t.Fatal(err)
+	}
+	if got := run(t, dst, "git", "config", "--worktree", "--bool", "--get", "commit.gpgsign"); got != "true" {
+		t.Fatalf("identity copy changed signing policy to %q", got)
+	}
+}
+
 func TestSetWorktreeCommitSigningPolicyRejectsStaleSharedLocalValue(t *testing.T) {
 	ctx := context.Background()
 	repo := initTestRepo(t)
@@ -453,6 +495,33 @@ func TestHasUncommittedChangesUntrackedFile(t *testing.T) {
 	}
 	if !dirty {
 		t.Fatal("expected dirty repo with untracked file")
+	}
+}
+
+func TestUntrackedFilesPreservesRawPaths(t *testing.T) {
+	dir := initTestRepo(t)
+	ctx := context.Background()
+
+	names := []string{"café.txt", "name with space.txt"}
+	if runtime.GOOS != "windows" {
+		names = []string{" plain ", "café.txt", "name with space.txt", "tab\tname"}
+	}
+	for _, name := range names {
+		writeFile(t, filepath.Join(dir, name), "new\n")
+	}
+
+	files, err := UntrackedFiles(ctx, dir)
+	if err != nil {
+		t.Fatalf("UntrackedFiles failed: %v", err)
+	}
+	want := names
+	if len(files) != len(want) {
+		t.Fatalf("UntrackedFiles = %#v, want %#v", files, want)
+	}
+	for i, path := range files {
+		if path != want[i] {
+			t.Fatalf("UntrackedFiles[%d] = %q, want %q", i, path, want[i])
+		}
 	}
 }
 

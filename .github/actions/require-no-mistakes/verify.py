@@ -18,6 +18,26 @@ The verdict is a pure function of the pull request body plus the PR head SHA:
 
 Nothing here reads the repository contents, so a fork's code is never executed.
 
+The PR body and head SHA compared in step 3 are read live from the GitHub API
+whenever possible (see live_pr_facts()), not from the workflow's own cached
+event payload. A GitHub Actions job RERUN replays the event payload archived
+at the run's ORIGINAL trigger rather than delivering a fresh one; re-running
+an old, already-superseded failed run therefore reproduces its stale verdict
+with a brand-new timestamp, which both GitHub's own required-check view and
+this repository's check-collapsing logic (internal/scm/github collapseLatestByName)
+treat as the current state - permanently resurrecting a stale failure on an
+otherwise-green commit with no clean recovery short of a new SHA. Live facts
+close that hole: a rerun of any age re-derives its verdict from the PR's
+actual current state instead of a frozen snapshot.
+
+When a live lookup is REQUIRED (no explicit pr-body/pr-head-sha input was
+forwarded) and it fails, main() fails the whole gate closed rather than
+falling back to the cached event payload: evaluating compliance against that
+payload is precisely the staleness hole described above, so a lookup failure
+must never itself become a route to a passing verdict on stale data. Grant
+this workflow `pull-requests: read`, or forward explicit pr-body/pr-head-sha
+inputs, to avoid depending on the live lookup at all.
+
 NON-GOAL: this gate is a CONTRIBUTOR GUARDRAIL, not a forgery-proof security
 boundary. The signature line and the attestation are author-editable assertions
 published in the PR body, so a hand-written body that reproduces the documented
@@ -38,8 +58,7 @@ import fnmatch
 import json
 import os
 import sys
-import threading
-import time
+import urllib.error
 import urllib.request
 
 SIGNATURE_MARKER = (
@@ -56,21 +75,13 @@ REQUIRED_STEPS = ("review", "test", "document")
 VERSION_FLOOR = "1.46.0"
 VERSION_FLOOR_PR = "https://github.com/kunchenguid/no-mistakes/pull/670"
 
-# A synchronize event can be delivered after the push but before the later PR
-# body edit that publishes the matching attestation. Re-read the forge's
-# current snapshot for a finite window. This is intentionally bounded and fails
-# closed when publication never settles or the API cannot be read.
-SYNCHRONIZE_SETTLE_ATTEMPTS = 10
-SYNCHRONIZE_SETTLE_DELAY_SECONDS = 1.0
-SYNCHRONIZE_SETTLE_SECONDS = 10.0
-
 
 def env(name: str) -> str:
     return (os.environ.get(name) or "").strip()
 
 
-def event_document() -> dict:
-    """Read the complete workflow event document, when supplied by the runner."""
+def event_payload() -> dict:
+    """Read the workflow event payload, so a caller need not forward PR facts."""
     path = os.environ.get("GITHUB_EVENT_PATH") or ""
     if not path or not os.path.exists(path):
         return {}
@@ -79,18 +90,59 @@ def event_document() -> dict:
             payload = json.load(handle)
     except (OSError, json.JSONDecodeError):
         return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def event_payload() -> dict:
-    """Read the pull-request portion of the workflow event document."""
-    pull_request = event_document().get("pull_request")
+    if not isinstance(payload, dict):
+        return {}
+    pull_request = payload.get("pull_request")
     return pull_request if isinstance(pull_request, dict) else {}
 
 
-def event_action() -> str:
-    action = event_document().get("action")
-    return action if isinstance(action, str) else ""
+LIVE_LOOKUP_TIMEOUT_SECONDS = 10
+
+
+def live_pr_facts(number: str) -> dict | None:
+    """Fetch the PR's current body and head SHA directly from the GitHub API.
+
+    This is the only source Facts uses for body/head_sha whenever a caller
+    forwards no explicit pr-body/pr-head-sha input. See the module docstring
+    for why the cached event_payload() is untrustworthy specifically on an
+    Actions job rerun, and why main() fails the whole gate closed - rather
+    than falling back to event_payload() - when this returns None in that
+    situation.
+
+    Returns None - never raises - whenever a live lookup cannot be attempted
+    (no token, no repo, no PR number) or fails for any reason (network error,
+    non-2xx response, unexpected body). A caller that has not granted the
+    token `pull-requests: read` degrades the same way: the request 403s and
+    this returns None.
+    """
+    token = env("GITHUB_TOKEN")
+    repo = env("GITHUB_REPOSITORY")
+    if not token or not repo or not number:
+        return None
+    api_url = env("GITHUB_API_URL") or "https://api.github.com"
+    request = urllib.request.Request(
+        f"{api_url}/repos/{repo}/pulls/{number}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=LIVE_LOOKUP_TIMEOUT_SECONDS) as response:
+            if response.status != 200:
+                return None
+            payload = json.load(response)
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    body = payload.get("body")
+    head = payload.get("head") if isinstance(payload.get("head"), dict) else {}
+    head_sha = head.get("sha")
+    if not isinstance(body, str) or not isinstance(head_sha, str) or not head_sha:
+        return None
+    return {"body": body, "head_sha": head_sha}
 
 
 def parse_list(raw: str) -> list[str]:
@@ -126,94 +178,37 @@ def fail(message: str) -> "NoReturn":  # type: ignore[name-defined]
 
 
 class Facts:
-    def __init__(self, payload: dict | None = None, *, use_environment: bool = True) -> None:
-        payload = payload if payload is not None else event_payload()
+    def __init__(self) -> None:
+        payload = event_payload()
         head = payload.get("head") if isinstance(payload.get("head"), dict) else {}
         user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
 
-        self.body = (os.environ.get("PR_BODY") or _payload_str(payload, "body")) if use_environment else _payload_str(payload, "body")
-        self.head_sha = (env("PR_HEAD_SHA") or _payload_str(head, "sha").strip()) if use_environment else _payload_str(head, "sha").strip()
-        self.head_ref = (env("PR_HEAD_REF") or _payload_str(head, "ref").strip()) if use_environment else _payload_str(head, "ref").strip()
-        self.author = (env("PR_AUTHOR") or _payload_str(user, "login").strip()) if use_environment else _payload_str(user, "login").strip()
-        number = env("PR_NUMBER") if use_environment else ""
+        self.head_ref = env("PR_HEAD_REF") or _payload_str(head, "ref").strip()
+        self.author = env("PR_AUTHOR") or _payload_str(user, "login").strip()
+        number = env("PR_NUMBER")
         if not number:
             raw_number = payload.get("number")
-            number = str(raw_number) if isinstance(raw_number, (int, str)) else ""
+            number = str(raw_number) if isinstance(raw_number, int) else ""
         self.number = number
 
-
-def synchronize_event() -> bool:
-    return env("GITHUB_EVENT_NAME") == "pull_request" and event_action() == "synchronize"
-
-
-def current_attestation_head(body: str) -> str:
-    start = body.find(ATTESTATION_PREFIX)
-    if start < 0:
-        return ""
-    start += len(ATTESTATION_PREFIX)
-    end = body.find(ATTESTATION_CLOSING, start)
-    if end < 0:
-        return ""
-    try:
-        payload = json.loads(body[start:end])
-    except json.JSONDecodeError:
-        return ""
-    if not isinstance(payload, dict):
-        return ""
-    head = payload.get("head_sha")
-    return head if isinstance(head, str) else ""
-
-
-def read_current_pr(number: str, deadline: float) -> Facts | None:
-    """Read the current PR snapshot through GitHub's read-only API."""
-    repository = env("GITHUB_REPOSITORY")
-    if not repository or not number:
-        return None
-    api = (env("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
-    request = urllib.request.Request(
-        f"{api}/repos/{repository}/pulls/{number}",
-        headers={"Accept": "application/vnd.github+json"},
-    )
-    token = env("GITHUB_TOKEN")
-    if token:
-        request.add_header("Authorization", f"Bearer {token}")
-
-    result: list[dict | None] = []
-
-    def fetch() -> None:
-        try:
-            timeout = max(0.001, min(5.0, deadline - time.monotonic()))
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                payload = json.load(response)
-            result.append(payload if isinstance(payload, dict) else None)
-        except Exception:
-            result.append(None)
-
-    worker = threading.Thread(target=fetch, daemon=True)
-    worker.start()
-    worker.join(max(0.0, deadline - time.monotonic()))
-    if not result or result[0] is None:
-        return None
-    current = Facts(result[0], use_environment=False)
-    if current.number != number:
-        return None
-    return current
-
-
-def settled_facts(facts: Facts) -> Facts:
-    """On synchronize, wait only for the bounded PR-body publication race."""
-    deadline = time.monotonic() + SYNCHRONIZE_SETTLE_SECONDS
-
-    for attempt in range(SYNCHRONIZE_SETTLE_ATTEMPTS):
-        latest = read_current_pr(facts.number, deadline)
-        if latest is not None and latest.head_sha == facts.head_sha and current_attestation_head(latest.body) == latest.head_sha:
-            return latest
-        remaining = deadline - time.monotonic()
-        if attempt + 1 >= SYNCHRONIZE_SETTLE_ATTEMPTS or remaining <= 0:
-            break
-        time.sleep(min(SYNCHRONIZE_SETTLE_DELAY_SECONDS, remaining))
-
-    fail("::error::could not read a settled current pull request snapshot for synchronize; refusing to judge stale or empty event data.\n")
+        # Explicit pr-body/pr-head-sha inputs are a caller driving this from a
+        # non-pull_request event (see README.md); they always win and are
+        # never second-guessed against a live lookup or the event payload.
+        explicit_body = os.environ.get("PR_BODY") or ""
+        explicit_head_sha = env("PR_HEAD_SHA")
+        self.live_lookup_attempted = False
+        self.live_lookup_used = False
+        live = None
+        if not explicit_body and not explicit_head_sha:
+            self.live_lookup_attempted = True
+            live = live_pr_facts(self.number)
+        if live is not None:
+            self.live_lookup_used = True
+            self.body = live["body"]
+            self.head_sha = live["head_sha"]
+        else:
+            self.body = explicit_body or _payload_str(payload, "body")
+            self.head_sha = explicit_head_sha or _payload_str(head, "sha").strip()
 
 
 def _payload_str(payload: dict, key: str) -> str:
@@ -341,12 +336,13 @@ def check_required_steps(facts: Facts, steps: list) -> None:
 
 def main() -> int:
     facts = Facts()
-    if synchronize_event():
-        event_facts = Facts(event_payload(), use_environment=False)
-        if not event_facts.number or not event_facts.head_sha:
-            fail("::error::pull_request synchronize event has empty PR identity; refusing to judge empty event data.\n")
-        facts = event_facts
 
+    # Exemption is evaluated even when the live lookup below failed: it never
+    # certifies compliance (it always emits compliant=false, see the comment
+    # below) and its inputs (author, head_ref) come from configured caller
+    # policy plus author/branch facts that do not change across a rerun the
+    # way body/head_sha can, so it carries none of the staleness risk the
+    # live-lookup gate exists to close.
     reason = exemption_reason(facts)
     if reason:
         print(f"Skipping no-mistakes enforcement: {reason}.")
@@ -359,8 +355,28 @@ def main() -> int:
         return 0
     emit_output("exempt", "false")
 
-    if synchronize_event():
-        facts = settled_facts(facts)
+    if facts.live_lookup_attempted and not facts.live_lookup_used:
+        # No explicit pr-body/pr-head-sha was forwarded (the documented
+        # zero-input integration), so this run needed the live lookup to
+        # know the PR's current body/head - and it failed. Falling back to
+        # the workflow's own cached event payload here would be exactly the
+        # hole this whole change exists to close: a GitHub Actions job RERUN
+        # replays the payload archived at the run's ORIGINAL trigger, not a
+        # live event, so evaluating compliance against it can certify a
+        # stale, already-superseded verdict instead of the PR's current
+        # state (see the module docstring). Fail closed instead of silently
+        # downgrading to that stale source.
+        fail(
+            "::error::Could not verify this PR's live body/head via the GitHub API, so "
+            "require-no-mistakes cannot safely evaluate compliance: falling back to the "
+            "workflow's own cached event payload risks certifying a stale, "
+            "already-superseded verdict if this job was rerun (see verify.py's module "
+            "docstring).\n\n"
+            "Add `pull-requests: read` to this workflow's `permissions:` so "
+            "require-no-mistakes can verify against live PR state, or forward explicit "
+            "`pr-body`/`pr-head-sha` inputs to bypass the live lookup entirely.\n\n"
+            f"PR author: {facts.author}\n"
+        )
 
     check_signature(facts)
     label = f"PR #{facts.number}" if facts.number else "PR"

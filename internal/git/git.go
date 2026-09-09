@@ -514,6 +514,12 @@ func PushCommit(ctx context.Context, dir, remote, commitSHA, ref, expectedSHA st
 	return pushSourceWithOptions(ctx, dir, remote, commitSHA, ref, expectedSHA, forceWithLease, nil)
 }
 
+// PushCommitWithOptions pushes an immutable commit with hook-visible options.
+// It keeps proof launch identity attached to the commit sampled before pushing.
+func PushCommitWithOptions(ctx context.Context, dir, remote, commitSHA, ref, expectedSHA string, forceWithLease bool, pushOptions []string) error {
+	return pushSourceWithOptions(ctx, dir, remote, commitSHA, ref, expectedSHA, forceWithLease, pushOptions)
+}
+
 // PushWithOptions pushes HEAD to a remote with per-push options.
 func PushWithOptions(ctx context.Context, dir, remote, ref, expectedSHA string, forceWithLease bool, pushOptions []string) error {
 	return pushSourceWithOptions(ctx, dir, remote, "HEAD", ref, expectedSHA, forceWithLease, pushOptions)
@@ -563,6 +569,26 @@ func HasUncommittedChanges(ctx context.Context, dir string) (bool, error) {
 		return false, err
 	}
 	return out != "", nil
+}
+
+// UntrackedFiles returns each untracked path in git's order. Ignored files
+// are not included.
+func UntrackedFiles(ctx context.Context, dir string) ([]string, error) {
+	out, err := RunRaw(ctx, dir, "status", "--porcelain", "-z", "--untracked-files=all")
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, entry := range strings.Split(string(out), "\x00") {
+		if len(entry) < 3 {
+			continue
+		}
+		// Porcelain format: XY <path>\0 where XY is a 2-char status code + space.
+		if entry[:2] == "??" {
+			files = append(files, entry[3:])
+		}
+	}
+	return files, nil
 }
 
 // CreateBranch creates a new branch with the given name and switches to it.
@@ -631,6 +657,54 @@ func CaptureCommitSigningPolicy(ctx context.Context, dir string) (string, *bool,
 	}
 	value := effective == "true"
 	return "", &value, nil
+}
+
+// CaptureRunCommitSigningPolicy freezes signing for one run without requiring
+// or changing repository configuration. Explicit unsigned admission wins;
+// otherwise the caller's effective boolean is preserved.
+func CaptureRunCommitSigningPolicy(ctx context.Context, dir string, unsigned bool) (string, *bool, error) {
+	if unsigned {
+		value := false
+		return "false", &value, nil
+	}
+	policy, err := Run(ctx, dir, "config", "--bool", "--get", "--default", "false", "commit.gpgsign")
+	if err != nil {
+		return "", nil, err
+	}
+	if policy != "true" && policy != "false" {
+		return "", nil, fmt.Errorf("invalid effective commit signing policy %q", policy)
+	}
+	confirmed, err := Run(ctx, dir, "config", "--bool", "--get", "--default", "false", "commit.gpgsign")
+	if err != nil {
+		return "", nil, err
+	}
+	if confirmed != policy {
+		return "", nil, fmt.Errorf("commit.gpgsign changed during signing policy capture")
+	}
+	value := policy == "true"
+	return policy, &value, nil
+}
+
+// CopyLocalUserIdentity copies only identity; signing is always command-local.
+func CopyLocalUserIdentity(ctx context.Context, srcDir, dstDir string) error {
+	for _, key := range []string{"user.name", "user.email"} {
+		value, err := Run(ctx, srcDir, "config", "--local", "--get", "--default", "", key)
+		if err != nil {
+			return err
+		}
+		if value == "" {
+			continue
+		}
+		if _, err := Run(ctx, dstDir, "config", "--worktree", key, value); err != nil {
+			if !isWorktreeConfigWriteUnavailable(err) {
+				return err
+			}
+			if _, err := Run(ctx, dstDir, "config", "--local", key, value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // ValidateRestoredCommitSigningPolicy verifies that a run worktree has no
@@ -709,6 +783,9 @@ func CommandCommitSigningPolicy(policy string, effective *bool) (string, error) 
 		return "", err
 	}
 	if policy != "" {
+		if effective != nil && *effective != (policy == "true") {
+			return "", fmt.Errorf("commit signing policy and effective value disagree")
+		}
 		return policy, nil
 	}
 	if effective == nil {

@@ -914,6 +914,51 @@ func TestPrepareRecoveredRunRejectsMismatchedSigningPolicy(t *testing.T) {
 	}
 }
 
+func TestPrepareRecoveredRunUsesNewCommandLocalPolicyWithoutConfigRequirement(t *testing.T) {
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	repo, headSHA := setupTestGitRepo(t, p, d, "command-local-signing-recovery")
+	run, err := d.InsertRun(repo.ID, "feature", headSHA, headSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetRunAwaitingAgent(run.ID); err != nil {
+		t.Fatal(err)
+	}
+	effective := false
+	if err := d.SetRunCommitSigningPolicy(run.ID, "false", &effective); err != nil {
+		t.Fatal(err)
+	}
+	worktree := filepath.Join(t.TempDir(), "repo-runs", run.ID)
+	gitCmd(t, p.RepoDir(repo.ID), "config", "extensions.worktreeConfig", "true")
+	gitCmd(t, p.RepoDir(repo.ID), "worktree", "add", "--detach", worktree, headSHA)
+	if err := d.SetRunWorktreeDir(run.ID, worktree); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, worktree, "config", "--worktree", "commit.gpgsign", "true")
+	stored, err := d.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewRunManager(d, p, nil).prepareRecoveredRun(context.Background(), stored)
+	if err != nil && strings.Contains(err.Error(), "commit.gpgsign") {
+		t.Fatalf("new command-local recovery consulted persistent signing config: %v", err)
+	}
+	if got := gitOutput(t, worktree, "config", "--worktree", "--bool", "--get", "commit.gpgsign"); got != "true" {
+		t.Fatalf("recovery mutated persistent signing config to %q", got)
+	}
+}
+
 // TestPrepareRecoveredRun_UnrecordedRunKeepsItsDefaultPlacement is the upgrade
 // path: a run parked at a gate when the operator upgraded to a build that
 // records placement has no recorded value, and then they add a worktree_roots

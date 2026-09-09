@@ -156,7 +156,7 @@ func TestRebaseStep_UsesConfiguredPRBaseBranch(t *testing.T) {
 	}
 }
 
-func TestTryRebaseUsesPersistedSigningPolicy(t *testing.T) {
+func TestTryRebaseRunScopedUnsignedBypassesConfiguredSigner(t *testing.T) {
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	gitCmd(t, dir, "checkout", "main")
 	if err := os.WriteFile(filepath.Join(dir, "main.txt"), []byte("main\n"), 0o644); err != nil {
@@ -172,7 +172,9 @@ func TestTryRebaseUsesPersistedSigningPolicy(t *testing.T) {
 
 	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
 	policy := "false"
+	effective := false
 	sctx.Run.CommitSigningPolicy = &policy
+	sctx.Run.CommitSigningEffective = &effective
 	conflicts, err := tryRebase(context.Background(), sctx, "main")
 	if err != nil {
 		t.Fatal(err)
@@ -182,7 +184,7 @@ func TestTryRebaseUsesPersistedSigningPolicy(t *testing.T) {
 	}
 	commit := gitCmd(t, dir, "cat-file", "commit", "HEAD")
 	if strings.Contains(commit, "\ngpgsig ") || strings.HasPrefix(commit, "gpgsig ") {
-		t.Fatal("persisted unsigned policy produced a signed rebased commit")
+		t.Fatal("run-scoped unsigned policy produced a signed rebased commit")
 	}
 }
 
