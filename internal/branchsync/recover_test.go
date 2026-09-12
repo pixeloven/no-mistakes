@@ -153,6 +153,80 @@ func newRecoverFixture(t *testing.T, status types.RunStatus) *recoverFixture {
 	}
 }
 
+func newDivergentArchiveRecoverFixture(t *testing.T) (*recoverFixture, string) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "upstream.git")
+	mustRun(t, root, "init", "--bare", remote)
+	local := filepath.Join(root, "operator")
+	mustRun(t, root, "init", "-b", "main", local)
+	configureIdentity(t, local)
+	mustWrite(t, filepath.Join(local, "file.txt"), "base\n")
+	mustRun(t, local, "add", "file.txt")
+	mustRun(t, local, "commit", "-m", "base")
+	base := mustRun(t, local, "rev-parse", "HEAD")
+	mustRun(t, local, "checkout", "-b", "feature/recover")
+	mustWrite(t, filepath.Join(local, "required.txt"), "required reviewed work\n")
+	mustRun(t, local, "add", "required.txt")
+	mustRun(t, local, "commit", "-m", "required reviewed head 354d610")
+	submitted := mustRun(t, local, "rev-parse", "HEAD")
+	mustRun(t, local, "push", remote, "refs/heads/feature/recover:refs/heads/feature/recover")
+
+	gate := filepath.Join(root, "gate.git")
+	mustRun(t, root, "init", "--bare", gate)
+	database, err := db.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	repo, err := database.InsertRepo(local, remote, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.InsertRun(repo.ID, "feature/recover", submitted, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunPushBinding(run.ID, db.PushBinding{
+		HeadSHA: submitted, TargetKind: "upstream", TargetFingerprint: TargetFingerprint(remote), Ref: "refs/heads/feature/recover",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	writer := filepath.Join(root, "divergent-archive-writer")
+	mustRun(t, root, "-c", "core.autocrlf=false", "clone", local, writer)
+	configureIdentity(t, writer)
+	mustRun(t, writer, "checkout", "-b", "divergent-later", base)
+	mustWrite(t, filepath.Join(writer, "later.txt"), "divergent later validation work\n")
+	mustRun(t, writer, "add", "later.txt")
+	mustRun(t, writer, "commit", "-m", "preserved later head 2a972a5")
+	preserved := mustRun(t, writer, "rev-parse", "HEAD")
+	anchorRef := custody.RecoveryRef(run.ID)
+	archiveRef := "refs/heads/archive/validation-" + run.ID + "-2a972a5"
+	mustRun(t, writer, "push", gate,
+		preserved+":refs/heads/feature/recover",
+		preserved+":"+anchorRef,
+	)
+	mustRun(t, local, "fetch", "--no-tags", gate, anchorRef+":"+archiveRef)
+	if err := database.UpdateRunStatusWithVerifiedHead(run.ID, types.RunCancelled, preserved); err != nil {
+		t.Fatal(err)
+	}
+	run, _ = database.GetRun(run.ID)
+	if _, err := database.RecordRecoveryArchive(db.RecoveryArchive{
+		OwnerRunID: run.ID, RepoID: repo.ID, RunID: run.ID, Branch: run.Branch,
+		RequiredHeadSHA: submitted, PreservedHeadSHA: preserved, ArchiveRef: archiveRef,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fixture := &recoverFixture{
+		t: t, ctx: ctx, db: database, repo: repo, run: run,
+		service: &Service{DB: database, Repo: repo, WorkDir: local, GateDir: gate},
+		local:   local, gate: gate, remote: remote, base: base, submitted: submitted, preserved: preserved,
+	}
+	return fixture, archiveRef
+}
+
 func (f *recoverFixture) anchorRef() string { return "refs/no-mistakes/recover/" + f.run.ID }
 
 func (f *recoverFixture) custodyReturned() bool {
@@ -162,6 +236,23 @@ func (f *recoverFixture) custodyReturned() bool {
 		f.t.Fatalf("reload run: %#v, %v", run, err)
 	}
 	return run.CustodyReturnedAt != nil
+}
+
+func assertKeepLocalRecoveryOffer(t *testing.T, state State) {
+	t.Helper()
+	if state.NextAction == nil || state.NextAction.Code != "recover_custody" || state.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("want keep-local recover_custody, got %#v", state.NextAction)
+	}
+}
+
+func assertManualReconciliationOffer(t *testing.T, state State) {
+	t.Helper()
+	if state.Safety != "blocked_recover_manual_reconciliation" {
+		t.Fatalf("want manual-reconciliation safety, got %#v", state)
+	}
+	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" || state.NextAction.Command != "no-mistakes axi status" {
+		t.Fatalf("want manual reconciliation guidance, got %#v", state.NextAction)
+	}
 }
 
 // TestTerminalPrePushRunSurfacesGuardedCustodyRecovery is the regression test
@@ -333,6 +424,45 @@ func TestRecoverIdempotentAfterSuccess(t *testing.T) {
 	}
 }
 
+func TestCustodyReturnedStaleGateRefusesFreshRunAndOffersSuccessor(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunFailed)
+	if err := f.db.SetRunCustodyReturned(f.run.ID); err != nil {
+		t.Fatal(err)
+	}
+	before := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover")
+	state := f.service.InspectCached(f.ctx)
+	if state.State != StateCustodyReturned || state.Safety != "blocked_custody_returned_gate_stale" {
+		t.Fatalf("stale stamped gate state = %#v", state)
+	}
+	if state.NextAction == nil || state.NextAction.Code != "create_successor_branch" ||
+		!strings.Contains(state.NextAction.Command, f.submitted) || !strings.Contains(state.NextAction.Command, "<unused-successor-branch>") {
+		t.Fatalf("stale stamped gate action = %#v", state.NextAction)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != before {
+		t.Fatalf("inspection moved stale gate from %s to %s", before, got)
+	}
+}
+
+func TestCustodyReturnedInvalidGateRefusesFreshRun(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunFailed)
+	if err := f.db.SetRunCustodyReturned(f.run.ID); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, f.gate, "update-ref", "-d", "refs/heads/feature/recover")
+	mustRun(t, f.gate, "symbolic-ref", "refs/heads/feature/recover", f.anchorRef())
+	state := f.service.InspectCached(f.ctx)
+	if state.State != StateCustodyReturned || state.Safety != "blocked_custody_returned_gate_invalid" {
+		t.Fatalf("invalid stamped gate state = %#v", state)
+	}
+	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
+		t.Fatalf("invalid stamped gate action = %#v", state.NextAction)
+	}
+}
+
 // TestRecoverWorktreeAlreadyAtPreservedHeadReturnsCustodyWithoutMutation
 // covers the equal cell: nothing to reconcile, custody return only.
 func TestRecoverWorktreeAlreadyAtPreservedHeadReturnsCustodyWithoutMutation(t *testing.T) {
@@ -400,9 +530,7 @@ func TestRecoverDirtyWorktreeRefusesWithoutMutation(t *testing.T) {
 	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
 	mustWrite(t, filepath.Join(f.local, "file.txt"), "dirty\n")
 	inspected := f.service.InspectCached(f.ctx)
-	if inspected.NextAction == nil || inspected.NextAction.Code == "recover_custody" {
-		t.Fatalf("dirty behind status advertised recovery = %#v", inspected)
-	}
+	assertManualReconciliationOffer(t, inspected)
 	state := f.service.Recover(f.ctx, false)
 	if state.Recovered || state.Changed || state.Safety != "blocked_recover_dirty" {
 		t.Fatalf("recover dirty = %#v", state)
@@ -418,11 +546,12 @@ func TestRecoverDirtyWorktreeRefusesWithoutMutation(t *testing.T) {
 	}
 }
 
-// TestRecoverDivergedRefusesButKeepLocalReturnsCustody covers the diverged
-// cells: the default refuses with the anchor named, and --keep-local performs
-// the explicit choice - custody at the local head, gate reset to it atomically,
-// preserved commits still reachable through the anchor ref.
-func TestRecoverDivergedRefusesButKeepLocalReturnsCustody(t *testing.T) {
+// TestInspectAdvertisesKeepLocalRecoveryForExactAnchoredDivergence models the
+// Operator incident: the clean local and terminal pipeline heads are siblings,
+// and only the gate's exact run-owned ref reaches the pipeline head. Inspection
+// must advertise the existing no-discard keep-local transaction, while plain
+// recovery still refuses and the advertised command preserves both heads.
+func TestInspectAdvertisesKeepLocalRecoveryForExactAnchoredDivergence(t *testing.T) {
 	t.Parallel()
 
 	f := newRecoverFixture(t, types.RunCancelled)
@@ -432,8 +561,14 @@ func TestRecoverDivergedRefusesButKeepLocalReturnsCustody(t *testing.T) {
 	mustRun(t, f.local, "commit", "-m", "diverging rescope")
 	divergedHead := mustRun(t, f.local, "rev-parse", "HEAD")
 	inspected := f.service.InspectCached(f.ctx)
-	if inspected.NextAction == nil || inspected.NextAction.Code == "recover_custody" {
-		t.Fatalf("uncontained divergence advertised recovery = %#v", inspected)
+	if inspected.State != StatePipelineOwned || inspected.Safety != "blocked_pipeline_owned_recoverable" {
+		t.Fatalf("anchored divergence inspection = %#v", inspected)
+	}
+	assertKeepLocalRecoveryOffer(t, inspected)
+	if inspected.Recovery == nil || inspected.Recovery.Source != "run_owned_anchor" ||
+		inspected.Recovery.RequiredHead != divergedHead || inspected.Recovery.PreservedHead != f.preserved ||
+		inspected.Recovery.RecoveryRef != f.anchorRef() || !inspected.Recovery.KeepLocal || inspected.Recovery.Proof != "verified" {
+		t.Fatalf("anchored divergence recovery evidence = %#v", inspected.Recovery)
 	}
 
 	refused := f.service.Recover(f.ctx, false)
@@ -466,6 +601,283 @@ func TestRecoverDivergedRefusesButKeepLocalReturnsCustody(t *testing.T) {
 	if !f.custodyReturned() {
 		t.Fatal("keep-local did not stamp custody")
 	}
+}
+
+func TestExactAnchoredDivergenceOfferFailsClosedWithoutEveryProof(t *testing.T) {
+	t.Parallel()
+
+	newDivergence := func(t *testing.T) (*recoverFixture, string) {
+		t.Helper()
+		f := newRecoverFixture(t, types.RunCancelled)
+		mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+		mustWrite(t, filepath.Join(f.local, "rescope.txt"), "rescope\n")
+		mustRun(t, f.local, "add", "rescope.txt")
+		mustRun(t, f.local, "commit", "-m", "diverging rescope")
+		return f, mustRun(t, f.local, "rev-parse", "HEAD")
+	}
+	assertNoRecovery := func(t *testing.T, state State) {
+		t.Helper()
+		if state.NextAction != nil && state.NextAction.Code == "recover_custody" {
+			t.Fatalf("unsafe state advertised recovery: %#v", state)
+		}
+	}
+
+	t.Run("dirty worktree", func(t *testing.T) {
+		f, _ := newDivergence(t)
+		mustWrite(t, filepath.Join(f.local, "dirty.txt"), "dirty\n")
+		assertNoRecovery(t, f.service.InspectCached(f.ctx))
+	})
+	t.Run("missing anchor", func(t *testing.T) {
+		f, _ := newDivergence(t)
+		mustRun(t, f.gate, "update-ref", "-d", f.anchorRef())
+		assertNoRecovery(t, f.service.InspectCached(f.ctx))
+	})
+	t.Run("mismatched anchor", func(t *testing.T) {
+		f, _ := newDivergence(t)
+		mustRun(t, f.gate, "update-ref", f.anchorRef(), f.submitted)
+		assertNoRecovery(t, f.service.InspectCached(f.ctx))
+	})
+	t.Run("symbolic anchor", func(t *testing.T) {
+		f, _ := newDivergence(t)
+		mustRun(t, f.gate, "update-ref", "-d", f.anchorRef())
+		mustRun(t, f.gate, "symbolic-ref", f.anchorRef(), "refs/heads/feature/recover")
+		assertNoRecovery(t, f.service.InspectCached(f.ctx))
+	})
+	t.Run("invalid gate branch", func(t *testing.T) {
+		f, _ := newDivergence(t)
+		mustRun(t, f.gate, "update-ref", "-d", "refs/heads/feature/recover")
+		mustRun(t, f.gate, "symbolic-ref", "refs/heads/feature/recover", f.anchorRef())
+		assertNoRecovery(t, f.service.InspectCached(f.ctx))
+	})
+	t.Run("newer owner", func(t *testing.T) {
+		f, localHead := newDivergence(t)
+		time.Sleep(1100 * time.Millisecond)
+		newer, err := f.db.InsertRun(f.repo.ID, f.run.Branch, localHead, f.base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.db.UpdateRunStatus(newer.ID, types.RunRunning); err != nil {
+			t.Fatal(err)
+		}
+		state := f.service.InspectCached(f.ctx)
+		if state.Pipeline.RunID != newer.ID || state.Safety != "blocked_pipeline_owned" {
+			t.Fatalf("newer owner did not win: %#v", state)
+		}
+		assertNoRecovery(t, state)
+	})
+}
+
+func TestBoundArchiveOffersOnlyKeepLocalRecoveryForDivergentLaterHead(t *testing.T) {
+	t.Parallel()
+
+	f, archiveRef := newDivergentArchiveRecoverFixture(t)
+	beforeLocalRefs := mustRun(t, f.local, "for-each-ref", "--format=%(refname) %(objectname) %(symref)")
+	beforeGateRefs := mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)")
+	state := f.service.InspectCached(f.ctx)
+	if state.State != StatePipelineOwned || state.Safety != "blocked_pipeline_owned_recoverable" || state.Relation != RelationDiverged {
+		t.Fatalf("archive-backed state = %#v", state)
+	}
+	if state.Recovery == nil || state.Recovery.Proof != "verified" || !state.Recovery.KeepLocal || state.Recovery.RequiredHead != f.submitted || state.Recovery.PreservedHead != f.preserved || state.Recovery.ArchiveRef != archiveRef {
+		t.Fatalf("archive recovery evidence = %#v", state.Recovery)
+	}
+	if state.NextAction == nil || state.NextAction.Code != "recover_custody" || state.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("archive next action = %#v", state.NextAction)
+	}
+	if got := mustRun(t, f.local, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); got != beforeLocalRefs {
+		t.Fatal("archive detection changed local refs")
+	}
+	if got := mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); got != beforeGateRefs {
+		t.Fatal("archive detection changed gate refs")
+	}
+
+	refused := f.service.Recover(f.ctx, false)
+	if refused.Recovered || refused.Changed || refused.Safety != "blocked_recover_archive_requires_keep_local" || refused.NextAction == nil || refused.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("default archive recovery = %#v", refused)
+	}
+	if got := mustRun(t, f.local, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); got != beforeLocalRefs {
+		t.Fatal("default archive refusal changed local refs")
+	}
+	if got := mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); got != beforeGateRefs {
+		t.Fatal("default archive refusal changed gate refs")
+	}
+
+	recovered := f.service.Recover(f.ctx, true)
+	if !recovered.Recovered || recovered.Changed {
+		t.Fatalf("keep-local archive recovery = %#v", recovered)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("archive recovery selected %s, want required %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.local, "rev-parse", archiveRef); got != f.preserved {
+		t.Fatalf("archive ref = %s, want preserved %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", f.anchorRef()); got != f.preserved {
+		t.Fatalf("gate recovery ref = %s, want preserved %s", got, f.preserved)
+	}
+}
+
+func TestBoundArchiveMovedAtRecoveryBoundaryRefusesWithoutRecoveryMutation(t *testing.T) {
+	t.Parallel()
+
+	f, archiveRef := newDivergentArchiveRecoverFixture(t)
+	gateRefs := mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)")
+	f.service.beforeGateReset = func() {
+		mustRun(t, f.local, "update-ref", archiveRef, f.submitted)
+	}
+	state := f.service.Recover(f.ctx, true)
+	if state.Recovered || state.Changed || state.Safety != "blocked_recover_archive_moved" {
+		t.Fatalf("recovery after archive move = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("archive race moved HEAD = %s", got)
+	}
+	if got := mustRun(t, f.local, "rev-parse", archiveRef); got != f.submitted {
+		t.Fatalf("archive race did not retain external moved value %s", got)
+	}
+	if _, err := gitpkg.Run(f.ctx, f.local, "show-ref", "--verify", f.anchorRef()); err == nil {
+		t.Fatal("archive race created a local recovery ref")
+	}
+	if got := mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); got != gateRefs {
+		t.Fatal("archive race refusal changed gate refs")
+	}
+	if f.custodyReturned() {
+		t.Fatal("archive race refusal stamped custody")
+	}
+}
+
+func TestBoundArchiveProofMatrixFailsClosedWithoutGitMutation(t *testing.T) {
+	t.Parallel()
+
+	f, archiveRef := newDivergentArchiveRecoverFixture(t)
+	records, err := f.db.GetRecoveryArchivesByRun(f.run.ID)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("archive records = %#v, %v", records, err)
+	}
+	validRecord := *records[0]
+	validState := f.service.InspectCached(f.ctx)
+	gitSnapshot := func() string {
+		return strings.Join([]string{
+			mustRun(t, f.local, "rev-parse", "HEAD"),
+			mustRun(t, f.local, "status", "--porcelain=v1", "--untracked-files=all"),
+			mustRun(t, f.local, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"),
+			mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"),
+		}, "\n---\n")
+	}
+	assertLiveRefusal := func(want string) {
+		t.Helper()
+		before := gitSnapshot()
+		state := f.service.InspectCached(f.ctx)
+		if state.Safety != want || state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
+			t.Fatalf("detection refusal = %#v, want %s/inspect_and_reconcile_manually", state, want)
+		}
+		if after := gitSnapshot(); after != before {
+			t.Fatal("archive detection changed Git state")
+		}
+		recovered := f.service.Recover(f.ctx, true)
+		if recovered.Recovered || recovered.Changed || recovered.Safety != want {
+			t.Fatalf("recovery refusal = %#v, want %s", recovered, want)
+		}
+		if after := gitSnapshot(); after != before {
+			t.Fatal("archive recovery refusal changed Git state")
+		}
+		if f.custodyReturned() {
+			t.Fatal("archive recovery refusal stamped custody")
+		}
+	}
+	restoreArchive := func() {
+		t.Helper()
+		// A direct ref makes symbolic-ref return nonzero; a symbolic test case
+		// needs the same operation to remove the indirection before restoration.
+		_, _ = gitpkg.Run(f.ctx, f.local, "symbolic-ref", "--delete", archiveRef)
+		mustRun(t, f.local, "update-ref", archiveRef, f.preserved)
+		if state := f.service.InspectCached(f.ctx); state.Safety != "blocked_pipeline_owned_recoverable" {
+			t.Fatalf("restored archive did not revalidate: %#v", state)
+		}
+	}
+
+	t.Run("missing", func(t *testing.T) {
+		mustRun(t, f.local, "update-ref", "-d", archiveRef)
+		assertLiveRefusal("blocked_recover_archive_missing")
+		restoreArchive()
+	})
+	t.Run("moved", func(t *testing.T) {
+		mustRun(t, f.local, "update-ref", archiveRef, f.submitted)
+		assertLiveRefusal("blocked_recover_archive_moved")
+		restoreArchive()
+	})
+	t.Run("replaced", func(t *testing.T) {
+		blobPath := filepath.Join(filepath.Dir(f.local), "archive-record-blob.txt")
+		mustWrite(t, blobPath, "not a commit\n")
+		blob := mustRun(t, f.local, "hash-object", "-w", blobPath)
+		looseRef := mustRun(t, f.local, "rev-parse", "--git-path", archiveRef)
+		if !filepath.IsAbs(looseRef) {
+			looseRef = filepath.Join(f.local, looseRef)
+		}
+		mustWrite(t, looseRef, blob+"\n")
+		assertLiveRefusal("blocked_recover_archive_replaced")
+		restoreArchive()
+	})
+	t.Run("symbolic", func(t *testing.T) {
+		mustRun(t, f.local, "symbolic-ref", archiveRef, "refs/heads/feature/recover")
+		assertLiveRefusal("blocked_recover_archive_symbolic")
+		restoreArchive()
+	})
+
+	metadataCases := []struct {
+		name   string
+		want   string
+		mutate func(*db.RecoveryArchive, *db.Run)
+	}{
+		{name: "malformed", want: "blocked_recover_archive_malformed", mutate: func(record *db.RecoveryArchive, _ *db.Run) { record.ArchiveRef = "refs/tags/archive/not-supported" }},
+		{name: "cross repository", want: "blocked_recover_archive_repository_mismatch", mutate: func(record *db.RecoveryArchive, _ *db.Run) { record.RepoID = "other-repo" }},
+		{name: "owner run mismatch", want: "blocked_recover_archive_run_mismatch", mutate: func(record *db.RecoveryArchive, _ *db.Run) { record.OwnerRunID = "other-run" }},
+		{name: "evidence run mismatch", want: "blocked_recover_archive_run_mismatch", mutate: func(record *db.RecoveryArchive, _ *db.Run) { record.RunID = "other-run" }},
+		{name: "wrong branch", want: "blocked_recover_archive_branch_mismatch", mutate: func(record *db.RecoveryArchive, _ *db.Run) { record.Branch = "other/branch" }},
+		{name: "stale required head", want: "blocked_recover_archive_required_head_mismatch", mutate: func(record *db.RecoveryArchive, _ *db.Run) { record.RequiredHeadSHA = strings.Repeat("a", 40) }},
+		{name: "hash mismatched preserved head", want: "blocked_recover_archive_preserved_head_mismatch", mutate: func(record *db.RecoveryArchive, _ *db.Run) { record.PreservedHeadSHA = record.RequiredHeadSHA }},
+		{name: "stale terminal provenance", want: "blocked_recover_archive_stale", mutate: func(_ *db.RecoveryArchive, run *db.Run) { run.TerminalHeadVerifiedAt = nil }},
+	}
+	for _, test := range metadataCases {
+		t.Run(test.name, func(t *testing.T) {
+			record := validRecord
+			run := *f.run
+			test.mutate(&record, &run)
+			before := gitSnapshot()
+			proof := f.service.verifyRecoveryArchiveRecord(f.ctx, &validState, &run, &record)
+			if proof.available || proof.safety != test.want || proof.evidence == nil || proof.evidence.Proof != test.want {
+				t.Fatalf("archive proof = %#v, want %s", proof, test.want)
+			}
+			if after := gitSnapshot(); after != before {
+				t.Fatal("metadata refusal changed Git state")
+			}
+		})
+	}
+
+	t.Run("moved gate branch", func(t *testing.T) {
+		writer := filepath.Join(filepath.Dir(f.local), "archive-gate-writer")
+		mustRun(t, filepath.Dir(writer), "-c", "core.autocrlf=false", "clone", f.gate, writer)
+		configureIdentity(t, writer)
+		mustRun(t, writer, "checkout", "feature/recover")
+		mustWrite(t, filepath.Join(writer, "other.txt"), "other gate work\n")
+		mustRun(t, writer, "add", "other.txt")
+		mustRun(t, writer, "commit", "-m", "other gate work")
+		moved := mustRun(t, writer, "rev-parse", "HEAD")
+		mustRun(t, writer, "push", "origin", "HEAD:refs/heads/feature/recover")
+		assertLiveRefusal("blocked_recover_archive_gate_head_mismatch")
+		mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.preserved, moved)
+	})
+
+	t.Run("multiple matching records", func(t *testing.T) {
+		secondRef := archiveRef + "-second"
+		mustRun(t, f.local, "update-ref", secondRef, f.preserved)
+		second := validRecord
+		second.ID = ""
+		second.ArchiveRef = secondRef
+		if _, err := f.db.RecordRecoveryArchive(second); err != nil {
+			t.Fatal(err)
+		}
+		assertLiveRefusal("blocked_recover_archive_ambiguous")
+	})
 }
 
 // TestRecoverKeepLocalDirtyBehindReturnsCustodyWithoutTouchingWorktree covers
@@ -513,16 +925,13 @@ func TestRecoverGateDivergenceAndUnavailabilityFailClosed(t *testing.T) {
 		movedGate := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover")
 		state := f.service.Recover(f.ctx, false)
 		if state.Recovered || state.Changed || state.Safety != "blocked_recover_gate_diverged" {
-			t.Fatalf("recover with independently advanced gate = %#v", state)
+			t.Fatalf("recover with moved gate = %#v", state)
 		}
 		if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
-			t.Fatalf("unsafe gate refusal moved local HEAD = %s, want %s", got, f.submitted)
+			t.Fatalf("moved-gate refusal changed HEAD = %s, want %s", got, f.submitted)
 		}
 		if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != movedGate {
-			t.Fatalf("unsafe recovery rewrote independent gate head = %s, want %s", got, movedGate)
-		}
-		if f.custodyReturned() {
-			t.Fatal("unsafe gate relationship stamped custody")
+			t.Fatalf("recovery rewrote independent gate head = %s, want %s", got, movedGate)
 		}
 	})
 	t.Run("gate branch deleted with recovery ref", func(t *testing.T) {
@@ -535,9 +944,6 @@ func TestRecoverGateDivergenceAndUnavailabilityFailClosed(t *testing.T) {
 		}
 		if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
 			t.Fatalf("recovered HEAD = %s, want %s", got, f.preserved)
-		}
-		if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
-			t.Fatalf("recovery did not recreate gate branch at preserved head: got %s, want %s", got, f.preserved)
 		}
 	})
 	t.Run("gate missing", func(t *testing.T) {
@@ -564,9 +970,7 @@ func TestRecoverReachableHeadRejectsConflictingGateAnchor(t *testing.T) {
 	mustRun(t, f.local, "reset", "--hard", f.preserved)
 
 	inspected := f.service.InspectCached(f.ctx)
-	if inspected.NextAction == nil || inspected.NextAction.Code == "recover_custody" {
-		t.Fatalf("inspect advertised recovery despite conflicting gate evidence = %#v", inspected)
-	}
+	assertManualReconciliationOffer(t, inspected)
 
 	state := f.service.Recover(f.ctx, false)
 	if state.Recovered || state.Changed || state.Safety != "blocked_recover_anchor_mismatch" {
@@ -611,9 +1015,7 @@ func TestRecoverRejectsSymbolicGateAnchorWithoutOverwritingIt(t *testing.T) {
 	mustRun(t, f.local, "reset", "--hard", f.preserved)
 
 	inspected := f.service.InspectCached(f.ctx)
-	if inspected.NextAction == nil || inspected.NextAction.Code == "recover_custody" {
-		t.Fatalf("inspect advertised recovery despite symbolic gate evidence = %#v", inspected)
-	}
+	assertManualReconciliationOffer(t, inspected)
 	state := f.service.Recover(f.ctx, false)
 	if state.Recovered || state.Safety != "blocked_recover_anchor_mismatch" {
 		t.Fatalf("recover with symbolic anchor = %#v", state)
@@ -851,12 +1253,12 @@ func TestRecoverUsesTerminalAnchorWhenGateBranchLags(t *testing.T) {
 	}
 }
 
-func TestInspectDoesNotAdvertiseRecoveryWhenRecordedHeadIsMissing(t *testing.T) {
+func TestInspectOffersKeepLocalWhenRecordedHeadIsMissing(t *testing.T) {
 	t.Parallel()
 
 	f := newRecoverFixture(t, types.RunCancelled)
 	missing := strings.Repeat("f", 40)
-	if err := f.db.UpdateRunStatusWithVerifiedHead(f.run.ID, types.RunCancelled, missing); err != nil {
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, missing); err != nil {
 		t.Fatal(err)
 	}
 
@@ -864,254 +1266,397 @@ func TestInspectDoesNotAdvertiseRecoveryWhenRecordedHeadIsMissing(t *testing.T) 
 	if state.Safety != "blocked_recover_preserved_head_missing" {
 		t.Fatalf("missing-head safety = %q, want blocked_recover_preserved_head_missing: %#v", state.Safety, state)
 	}
-	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
+	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
 		t.Fatalf("missing-head next action = %#v", state.NextAction)
 	}
-	if state.NextAction.Code == "recover_custody" {
-		t.Fatal("missing recorded head advertised an impossible recovery")
+	if state.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("missing-head recovery command = %q", state.NextAction.Command)
 	}
 }
 
-func TestInspectAdvertisesRecoveryFromExactGateObjectEvenWhenBranchLags(t *testing.T) {
+func TestInspectDoesNotOfferKeepLocalForUnverifiedMissingHead(t *testing.T) {
 	t.Parallel()
 
 	f := newRecoverFixture(t, types.RunCancelled)
-	// The exact recorded head remains in this run's gate object database even
-	// though the branch ref was moved back and no recovery ref was created yet.
-	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted)
-	state := f.service.InspectCached(f.ctx)
-	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
-		t.Fatalf("exact gate object did not advertise recovery = %#v", state)
-	}
-}
-
-func TestInspectAdvertisesRecoveryFromExactRunAnchorEvenWhenGateBranchDiffers(t *testing.T) {
-	t.Parallel()
-
-	f := newRecoverFixture(t, types.RunCancelled)
-	// The gate branch may have moved independently after the terminal run, but
-	// the exact run-owned recovery ref is sufficient custody evidence for the
-	// recorded head. A same-named ref from another run must not be accepted.
-	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted)
-	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
-
-	state := f.service.InspectCached(f.ctx)
-	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
-		t.Fatalf("exact run anchor did not advertise recovery = %#v", state)
-	}
-	if got := mustRun(t, f.gate, "rev-parse", f.anchorRef()+"^{commit}"); got != f.preserved {
-		t.Fatalf("run anchor changed during inspection: got %s, want %s", got, f.preserved)
-	}
-}
-
-func TestInspectAdvertisesRecoveryForLocalAheadWithGateAnchor(t *testing.T) {
-	t.Parallel()
-
-	f := newRecoverFixture(t, types.RunCancelled)
-	mustRun(t, f.local, "fetch", f.gate, f.preserved)
-	mustRun(t, f.local, "merge", "--ff-only", f.preserved)
-	mustWrite(t, filepath.Join(f.local, "operator.txt"), "operator follow-up\n")
-	mustRun(t, f.local, "add", "operator.txt")
-	mustRun(t, f.local, "commit", "-m", "operator follow-up")
-	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
-
-	state := f.service.InspectCached(f.ctx)
-	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
-		t.Fatalf("local-ahead anchored state did not advertise recovery = %#v", state)
-	}
-}
-
-func TestInspectUsesLocalRecoveryWhenUnanchoredGateObjectWasPruned(t *testing.T) {
-	t.Parallel()
-
-	f := newRecoverFixture(t, types.RunCancelled)
-	mustRun(t, f.local, "fetch", f.gate, f.preserved)
-	mustRun(t, f.local, "merge", "--ff-only", f.preserved)
-	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
-	mustRun(t, f.gate, "reflog", "expire", "--expire=now", "--all")
-	mustRun(t, f.gate, "gc", "--prune=now")
-	if _, err := gitpkg.Run(f.ctx, f.gate, "cat-file", "-e", f.preserved); err == nil {
-		t.Fatal("fixture did not prune the preserved object from the gate")
-	}
-
-	state := f.service.InspectCached(f.ctx)
-	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
-		t.Fatalf("local-only preserved head did not advertise recovery = %#v", state)
-	}
-	recovered := f.service.Recover(f.ctx, false)
-	if !recovered.Recovered || recovered.Changed {
-		t.Fatalf("local-only recovery = %#v", recovered)
-	}
-}
-
-func TestInspectDoesNotAdvertiseRecoveryFromAnotherRunsAnchor(t *testing.T) {
-	t.Parallel()
-
-	f := newRecoverFixture(t, types.RunCancelled)
-	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted)
-	mustRun(t, f.gate, "update-ref", custody.RecoveryRef("another-run"), f.preserved)
-
-	state := f.service.InspectCached(f.ctx)
-	if state.Safety != "blocked_recover_preserved_head_invalid" {
-		t.Fatalf("foreign-anchor safety = %q", state.Safety)
-	}
-	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
-		t.Fatalf("foreign-anchor next action = %#v", state.NextAction)
-	}
-}
-
-func TestInspectDoesNotAdvertiseAmbiguousRecoveryOwnership(t *testing.T) {
-	t.Parallel()
-
-	f := newRecoverFixture(t, types.RunCancelled)
-	mustRun(t, f.gate, "update-ref", custody.RecoveryRef("another-run"), f.preserved)
-
-	state := f.service.InspectCached(f.ctx)
-	if state.Safety != "blocked_recover_preserved_head_invalid" {
-		t.Fatalf("ambiguous-ownership safety = %q", state.Safety)
-	}
-	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
-		t.Fatalf("ambiguous-ownership next action = %#v", state.NextAction)
-	}
-}
-
-func TestInspectDoesNotAdvertiseRecoveryFromUnrelatedGateRef(t *testing.T) {
-	t.Parallel()
-
-	f := newRecoverFixture(t, types.RunCancelled)
-	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted)
-	mustRun(t, f.gate, "update-ref", "refs/heads/unrelated", f.preserved)
-
-	state := f.service.InspectCached(f.ctx)
-	if state.Safety != "blocked_recover_preserved_head_invalid" {
-		t.Fatalf("unrelated-ref safety = %q", state.Safety)
-	}
-	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
-		t.Fatalf("unrelated-ref next action = %#v", state.NextAction)
-	}
-}
-
-func TestInspectDoesNotTreatRevisionExpressionAsRecordedHead(t *testing.T) {
-	t.Parallel()
-
-	f := newRecoverFixture(t, types.RunCancelled)
-	if err := f.db.UpdateRunStatusWithVerifiedHead(f.run.ID, types.RunCancelled, "HEAD"); err != nil {
+	missing := strings.Repeat("f", 40)
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, missing); err != nil {
 		t.Fatal(err)
 	}
-	f.service.GateDir = ""
-
-	state := f.service.InspectCached(f.ctx)
-	if state.Safety != "blocked_recover_preserved_head_invalid" {
-		t.Fatalf("corrupt-record safety = %q", state.Safety)
-	}
-	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
-		t.Fatalf("corrupt-record next action = %#v", state.NextAction)
-	}
-	recovered := f.service.Recover(f.ctx, false)
-	if recovered.Recovered || f.custodyReturned() {
-		t.Fatalf("corrupt record recovered custody = %#v", recovered)
-	}
-}
-
-func TestInspectRejectsSHA256HeadPrefixAsInvalid(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	root := t.TempDir()
-	remote := filepath.Join(root, "remote.git")
-	local := filepath.Join(root, "local")
-	gate := filepath.Join(root, "gate.git")
-	mustRun(t, root, "init", "--bare", "--object-format=sha256", remote)
-	mustRun(t, root, "init", "--object-format=sha256", "-b", "main", local)
-	configureIdentity(t, local)
-	mustWrite(t, filepath.Join(local, "file.txt"), "base\n")
-	mustRun(t, local, "add", "file.txt")
-	mustRun(t, local, "commit", "-m", "base")
-	base := mustRun(t, local, "rev-parse", "HEAD")
-	mustRun(t, local, "checkout", "-b", "feature/recover")
-	mustWrite(t, filepath.Join(local, "file.txt"), "submitted\n")
-	mustRun(t, local, "commit", "-am", "submitted")
-	submitted := mustRun(t, local, "rev-parse", "HEAD")
-	mustRun(t, root, "init", "--bare", "--object-format=sha256", gate)
-	mustRun(t, local, "push", gate, "refs/heads/feature/recover:refs/heads/feature/recover")
-	pipeline := filepath.Join(root, "pipeline")
-	mustRun(t, root, "clone", gate, pipeline)
-	configureIdentity(t, pipeline)
-	mustRun(t, pipeline, "checkout", "feature/recover")
-	mustWrite(t, filepath.Join(pipeline, "pipeline.txt"), "pipeline\n")
-	mustRun(t, pipeline, "add", "pipeline.txt")
-	mustRun(t, pipeline, "commit", "-m", "pipeline")
-	preserved := mustRun(t, pipeline, "rev-parse", "HEAD")
-	mustRun(t, pipeline, "push", "origin", "HEAD:refs/heads/feature/recover")
-	prefix := preserved[:40]
-
-	database, err := db.Open(filepath.Join(root, "state.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { database.Close() })
-	repo, err := database.InsertRepo(local, remote, "main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	run, err := database.InsertRun(repo.ID, "feature/recover", submitted, base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.UpdateRunStatusWithVerifiedHead(run.ID, types.RunCancelled, prefix); err != nil {
-		t.Fatal(err)
-	}
-	service := &Service{DB: database, Repo: repo, WorkDir: local, GateDir: gate}
-
-	state := service.InspectCached(ctx)
-	if state.Safety != "blocked_recover_preserved_head_invalid" || state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
-		t.Fatalf("SHA-256 prefix inspection = %#v", state)
-	}
-	recovered := service.Recover(ctx, false)
-	if recovered.Recovered || recovered.Safety != "blocked_recover_preserved_head_invalid" {
-		t.Fatalf("SHA-256 prefix recovery = %#v", recovered)
-	}
-	if err := database.UpdateRunStatus(run.ID, types.RunCancelled); err != nil {
-		t.Fatal(err)
-	}
-	if err := database.UpdateRunHeadSHA(run.ID, prefix); err != nil {
-		t.Fatal(err)
-	}
-	recovered = service.Recover(ctx, false)
-	if recovered.Recovered || recovered.Safety != "blocked_recover_preserved_head_invalid" {
-		t.Fatalf("unverified SHA-256 prefix recovery = %#v", recovered)
-	}
-	stored, err := database.GetRun(run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored.HeadSHA != prefix || stored.CustodyReturnedAt != nil {
-		t.Fatalf("SHA-256 prefix was normalized or custody returned: %#v", stored)
-	}
-}
-
-func TestRecoverRejectsUnverifiedRevisionExpressionBeforeNormalization(t *testing.T) {
-	t.Parallel()
-
-	f := newRecoverFixture(t, types.RunCancelled)
-	corrupt := "refs/heads/feature/recover~1"
 	if err := f.db.UpdateRunStatus(f.run.ID, types.RunCancelled); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.db.UpdateRunHeadSHA(f.run.ID, corrupt); err != nil {
+
+	state := f.service.InspectCached(f.ctx)
+	assertManualReconciliationOffer(t, state)
+	kept := f.service.Recover(f.ctx, true)
+	if kept.Recovered || kept.Safety != "blocked_recover_unverified_head" {
+		t.Fatalf("keep-local with unverified missing head = %#v", kept)
+	}
+	if f.custodyReturned() {
+		t.Fatal("unverified missing head stamped custody")
+	}
+}
+
+func TestRecoverKeepLocalReturnsCustodyWhenRecordedHeadIsMissing(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	missing := strings.Repeat("f", 40)
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, missing); err != nil {
 		t.Fatal(err)
 	}
+	localHead := mustRun(t, f.local, "rev-parse", "HEAD")
 
-	state := f.service.Recover(f.ctx, false)
-	if state.Recovered || state.Safety != "blocked_recover_preserved_head_invalid" {
-		t.Fatalf("unverified corrupt-head recovery = %#v", state)
+	refused := f.service.Recover(f.ctx, false)
+	if refused.Recovered || refused.Safety != "blocked_recover_preserved_head_missing" {
+		t.Fatalf("plain recover with missing head = %#v", refused)
 	}
-	run, err := f.db.GetRun(f.run.ID)
+	if f.custodyReturned() {
+		t.Fatal("plain recover stamped custody for a missing preserved head")
+	}
+
+	kept := f.service.Recover(f.ctx, true)
+	if !kept.Recovered || kept.Changed {
+		t.Fatalf("keep-local recover with missing head = %#v", kept)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != localHead {
+		t.Fatal("keep-local moved the local head")
+	}
+	if !f.custodyReturned() {
+		t.Fatal("keep-local did not stamp custody")
+	}
+	after := f.service.InspectCached(f.ctx)
+	if after.State != StateCustodyReturned {
+		t.Fatalf("post-keep-local inspect = %#v", after)
+	}
+}
+
+func TestRecoverKeepLocalReleasesAllStrandedTerminalRuns(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	tree := mustRun(t, f.gate, "rev-parse", f.preserved+"^{tree}")
+	olderHead := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", tree, "-p", f.preserved, "-m", "older missing head")
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", olderHead)
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, olderHead); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(f.gate, "objects", olderHead[:2], olderHead[2:])); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	newest, err := f.db.InsertRun(f.repo.ID, "feature/recover", f.submitted, f.base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.HeadSHA != corrupt || f.custodyReturned() {
-		t.Fatalf("corrupt head was normalized or custody returned: %#v", run)
+	if err := f.db.UpdateRunStatusWithVerifiedHead(newest.ID, types.RunFailed, strings.Repeat("f", 40)); err != nil {
+		t.Fatal(err)
+	}
+
+	state := f.service.InspectCached(f.ctx)
+	if state.Pipeline.RunID != newest.ID || state.NextAction == nil || state.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("stacked missing-head state = %#v", state)
+	}
+	kept := f.service.Recover(f.ctx, true)
+	if !kept.Recovered {
+		t.Fatalf("stacked keep-local recover = %#v", kept)
+	}
+	for _, id := range []string{f.run.ID, newest.ID} {
+		run, err := f.db.GetRun(id)
+		if err != nil || run == nil || run.CustodyReturnedAt == nil {
+			t.Fatalf("run %s custody = %#v, %v", id, run, err)
+		}
+	}
+	after := f.service.InspectCached(f.ctx)
+	if after.State != StateCustodyReturned {
+		t.Fatalf("stacked post-keep-local inspect = %#v", after)
+	}
+}
+
+func TestRecoverKeepLocalReleasesMixedEvidenceStack(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	time.Sleep(1100 * time.Millisecond)
+	newest, err := f.db.InsertRun(f.repo.ID, "feature/recover", f.submitted, f.base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.UpdateRunStatusWithVerifiedHead(newest.ID, types.RunFailed, strings.Repeat("f", 40)); err != nil {
+		t.Fatal(err)
+	}
+
+	state := f.service.InspectCached(f.ctx)
+	if state.Pipeline.RunID != newest.ID || state.NextAction == nil || state.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("mixed stack state = %#v", state)
+	}
+	kept := f.service.Recover(f.ctx, true)
+	if !kept.Recovered {
+		t.Fatalf("mixed stack recovery = %#v", kept)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", f.anchorRef()+"^{commit}"); got != f.preserved {
+		t.Fatalf("older preserved anchor = %s, want %s", got, f.preserved)
+	}
+	for _, id := range []string{f.run.ID, newest.ID} {
+		run, err := f.db.GetRun(id)
+		if err != nil || run == nil || run.CustodyReturnedAt == nil {
+			t.Fatalf("run %s custody = %#v, %v", id, run, err)
+		}
+	}
+}
+
+func TestRecoverKeepLocalReleasesStackWhenOlderHeadIsMissing(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, strings.Repeat("f", 40)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	newest, err := f.db.InsertRun(f.repo.ID, "feature/recover", f.submitted, f.base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.UpdateRunStatusWithVerifiedHead(newest.ID, types.RunFailed, f.preserved); err != nil {
+		t.Fatal(err)
+	}
+
+	state := f.service.InspectCached(f.ctx)
+	if state.Pipeline.RunID != newest.ID || state.NextAction == nil || state.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("older missing-head stack state = %#v", state)
+	}
+	kept := f.service.Recover(f.ctx, true)
+	if !kept.Recovered {
+		t.Fatalf("older missing-head stack recovery = %#v", kept)
+	}
+	for _, id := range []string{f.run.ID, newest.ID} {
+		run, err := f.db.GetRun(id)
+		if err != nil || run == nil || run.CustodyReturnedAt == nil {
+			t.Fatalf("run %s custody = %#v, %v", id, run, err)
+		}
+	}
+}
+
+func TestRecoverKeepLocalPreservesHeadRestoredAfterPreflight(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	tree := mustRun(t, f.gate, "rev-parse", f.preserved+"^{tree}")
+	restoredHead := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", tree, "-p", f.preserved, "-m", "restored head")
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", restoredHead)
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, restoredHead); err != nil {
+		t.Fatal(err)
+	}
+	objectPath := filepath.Join(f.gate, "objects", restoredHead[:2], restoredHead[2:])
+	objectData, err := os.ReadFile(objectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(objectPath); err != nil {
+		t.Fatal(err)
+	}
+	f.service.beforeGateReset = func() {
+		if err := os.WriteFile(objectPath, objectData, 0o444); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	state := f.service.Recover(f.ctx, true)
+	if !state.Recovered {
+		t.Fatalf("recovery with restored head = %#v", state)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", f.anchorRef()+"^{commit}"); got != restoredHead {
+		t.Fatalf("restored recovery anchor = %s, want %s", got, restoredHead)
+	}
+}
+
+func TestRecoverKeepLocalIgnoresSupersededUnpublishedRuns(t *testing.T) {
+	f := newRecoverFixture(t, types.RunCancelled)
+	binding := db.PushBinding{HeadSHA: f.submitted, TargetKind: "upstream", TargetFingerprint: TargetFingerprint(f.remote), Ref: "refs/heads/feature/recover"}
+	if err := f.db.UpdateRunPushBinding(f.run.ID, binding); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	pushed, err := f.db.InsertRun(f.repo.ID, "feature/recover", f.submitted, f.base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.UpdateRunStatusWithVerifiedHead(pushed.ID, types.RunCompleted, f.preserved); err != nil {
+		t.Fatal(err)
+	}
+	binding.HeadSHA = f.preserved
+	if err := f.db.UpdateRunPushBinding(pushed.ID, binding); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	missing, err := f.db.InsertRun(f.repo.ID, "feature/recover", f.submitted, f.base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.UpdateRunStatusWithVerifiedHead(missing.ID, types.RunFailed, strings.Repeat("f", 40)); err != nil {
+		t.Fatal(err)
+	}
+
+	state := f.service.InspectCached(f.ctx)
+	if state.Pipeline.RunID != missing.ID || state.NextAction == nil || state.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("missing-head state after superseded run = %#v", state)
+	}
+	kept := f.service.Recover(f.ctx, true)
+	if !kept.Recovered {
+		t.Fatalf("missing-head recovery after superseded run = %#v", kept)
+	}
+	old, err := f.db.GetRun(f.run.ID)
+	if err != nil || old == nil || old.CustodyReturnedAt != nil {
+		t.Fatalf("superseded run custody = %#v, %v", old, err)
+	}
+	latest, err := f.db.GetRun(missing.ID)
+	if err != nil || latest == nil || latest.CustodyReturnedAt == nil {
+		t.Fatalf("missing run custody = %#v, %v", latest, err)
+	}
+}
+
+func TestRecoverKeepLocalPreflightsEveryStrandedRun(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		setup func(*recoverFixture, *db.Run)
+	}{
+		{
+			name: "conflicting anchor",
+			setup: func(f *recoverFixture, older *db.Run) {
+				if err := f.db.UpdateRunStatusWithVerifiedHead(older.ID, types.RunFailed, strings.Repeat("e", 40)); err != nil {
+					f.t.Fatal(err)
+				}
+				mustRun(f.t, f.gate, "update-ref", custody.RecoveryRef(older.ID), f.submitted)
+			},
+		},
+		{
+			name: "unverified head",
+			setup: func(f *recoverFixture, older *db.Run) {
+				if err := f.db.UpdateRunHeadSHA(older.ID, strings.Repeat("e", 40)); err != nil {
+					f.t.Fatal(err)
+				}
+				if err := f.db.UpdateRunStatus(older.ID, types.RunFailed); err != nil {
+					f.t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newRecoverFixture(t, types.RunCancelled)
+			tt.setup(f, f.run)
+			time.Sleep(1100 * time.Millisecond)
+			newest, err := f.db.InsertRun(f.repo.ID, "feature/recover", f.submitted, f.base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.db.UpdateRunStatusWithVerifiedHead(newest.ID, types.RunFailed, strings.Repeat("f", 40)); err != nil {
+				t.Fatal(err)
+			}
+
+			state := f.service.InspectCached(f.ctx)
+			if state.Pipeline.RunID != newest.ID {
+				t.Fatalf("selected run = %s, want %s", state.Pipeline.RunID, newest.ID)
+			}
+			assertManualReconciliationOffer(t, state)
+			kept := f.service.Recover(f.ctx, true)
+			if kept.Recovered || kept.Safety != "blocked_recover_manual_reconciliation" {
+				t.Fatalf("keep-local with unsafe older run = %#v", kept)
+			}
+			for _, id := range []string{f.run.ID, newest.ID} {
+				run, err := f.db.GetRun(id)
+				if err != nil || run == nil || run.CustodyReturnedAt != nil {
+					t.Fatalf("run %s custody = %#v, %v", id, run, err)
+				}
+			}
+		})
+	}
+}
+
+func TestRecoverMissingHeadRevalidatesGateBeforeStamping(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		mutateGate func(*recoverFixture)
+		wantSafety string
+	}{
+		{
+			name: "gate disappears",
+			mutateGate: func(f *recoverFixture) {
+				if err := os.RemoveAll(f.gate); err != nil {
+					f.t.Fatal(err)
+				}
+			},
+			wantSafety: "blocked_recover_gate_unavailable",
+		},
+		{
+			name: "equal gate branch moves",
+			mutateGate: func(f *recoverFixture) {
+				mustRun(f.t, f.gate, "update-ref", "refs/heads/feature/recover", f.base)
+			},
+			wantSafety: "blocked_recover_gate_race",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newRecoverFixture(t, types.RunCancelled)
+			if err := f.db.UpdateRunHeadSHA(f.run.ID, strings.Repeat("f", 40)); err != nil {
+				t.Fatal(err)
+			}
+			mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted)
+			f.service.beforeGateReset = func() { tt.mutateGate(f) }
+
+			state := f.service.Recover(f.ctx, true)
+			if state.Recovered || state.Safety != tt.wantSafety {
+				t.Fatalf("recovery after gate mutation = %#v", state)
+			}
+			if f.custodyReturned() {
+				t.Fatal("stale gate evidence stamped custody")
+			}
+		})
+	}
+}
+
+func TestRecoverKeepLocalRefusesDanglingIndependentGateHead(t *testing.T) {
+	f := newRecoverFixture(t, types.RunCancelled)
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, strings.Repeat("f", 40)); err != nil {
+		t.Fatal(err)
+	}
+	tree := mustRun(t, f.gate, "rev-parse", f.preserved+"^{tree}")
+	dangling := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", tree, "-p", f.preserved, "-m", "independent")
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", dangling)
+	if err := os.Remove(filepath.Join(f.gate, "objects", dangling[:2], dangling[2:])); err != nil {
+		t.Fatal(err)
+	}
+
+	inspected := f.service.InspectCached(f.ctx)
+	assertManualReconciliationOffer(t, inspected)
+	state := f.service.Recover(f.ctx, true)
+	if state.Recovered || state.Safety != "blocked_recover_manual_reconciliation" {
+		t.Fatalf("recovery with dangling independent gate head = %#v", state)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != dangling {
+		t.Fatalf("gate head = %s, want dangling head %s", got, dangling)
+	}
+	if f.custodyReturned() {
+		t.Fatal("dangling independent gate head stamped custody")
+	}
+}
+
+func TestInspectDoesNotAdvertiseRecoveryWhenIndependentGateAnchorConflicts(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, strings.Repeat("f", 40)); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, f.gate, "update-ref", custody.RecoveryGateRef(f.run.ID), f.submitted)
+
+	state := f.service.InspectCached(f.ctx)
+	assertManualReconciliationOffer(t, state)
+	kept := f.service.Recover(f.ctx, true)
+	if kept.Recovered || kept.Safety != "blocked_recover_manual_reconciliation" {
+		t.Fatalf("keep-local with conflicting independent gate anchor = %#v", kept)
+	}
+	if f.custodyReturned() {
+		t.Fatal("conflicting independent gate anchor stamped custody")
 	}
 }
 
@@ -1119,21 +1664,20 @@ func TestInspectDoesNotAdvertiseRecoveryWhenTerminalAnchorConflicts(t *testing.T
 	t.Parallel()
 
 	f := newRecoverFixture(t, types.RunCancelled)
-	// The recorded preserved commit remains available in the gate, but the
-	// run-specific evidence points elsewhere. Status must honor that conflict
-	// instead of advertising a recovery command that Recover will refuse.
-	mustRun(t, f.local, "fetch", f.gate, f.preserved)
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, strings.Repeat("f", 40)); err != nil {
+		t.Fatal(err)
+	}
 	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.submitted)
 
 	state := f.service.InspectCached(f.ctx)
-	if state.Safety != "blocked_recover_preserved_head_invalid" {
-		t.Fatalf("conflicting-anchor safety = %q, want blocked_recover_preserved_head_invalid: %#v", state.Safety, state)
+	assertManualReconciliationOffer(t, state)
+
+	kept := f.service.Recover(f.ctx, true)
+	if kept.Recovered || kept.Safety != "blocked_recover_manual_reconciliation" {
+		t.Fatalf("keep-local with conflicting anchor = %#v", kept)
 	}
-	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
-		t.Fatalf("conflicting-anchor next action = %#v", state.NextAction)
-	}
-	if state.NextAction.Code == "recover_custody" {
-		t.Fatal("conflicting terminal anchor advertised a recovery that must fail")
+	if f.custodyReturned() {
+		t.Fatal("keep-local stamped custody despite conflicting evidence")
 	}
 }
 
@@ -1148,75 +1692,29 @@ func TestInspectDoesNotAdvertiseRecoveryWhenTerminalAnchorIsNotACommit(t *testin
 	mustRun(t, f.gate, "update-ref", f.anchorRef(), blob)
 
 	state := f.service.InspectCached(f.ctx)
-	if state.Safety != "blocked_recover_preserved_head_invalid" {
-		t.Fatalf("non-commit-anchor safety = %q", state.Safety)
-	}
-	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
-		t.Fatalf("non-commit-anchor next action = %#v", state.NextAction)
-	}
-	if state.NextAction.Code == "recover_custody" {
-		t.Fatal("non-commit terminal anchor advertised a recovery that must fail")
-	}
+	assertManualReconciliationOffer(t, state)
 	if got := mustRun(t, f.gate, "rev-parse", f.anchorRef()); got != blob {
 		t.Fatalf("status inspection changed conflicting anchor: got %s, want %s", got, blob)
 	}
 }
 
-func TestRecoverRejectsPeelableTagRecoveryAnchor(t *testing.T) {
+func TestMissingHeadRecoveryRequiresAccessibleGate(t *testing.T) {
 	t.Parallel()
 
 	f := newRecoverFixture(t, types.RunCancelled)
-	mustRun(t, f.gate, "-c", "user.name=No Mistakes Test", "-c", "user.email=test@example.com", "tag", "-a", "-m", "peelable", "peelable", f.preserved)
-	tag := mustRun(t, f.gate, "rev-parse", "refs/tags/peelable^{tag}")
-	mustRun(t, f.gate, "update-ref", f.anchorRef(), tag)
-
-	state := f.service.Recover(f.ctx, false)
-	if state.Recovered || state.Safety != "blocked_recover_anchor_mismatch" {
-		t.Fatalf("peelable-tag recovery = %#v", state)
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, strings.Repeat("f", 40)); err != nil {
+		t.Fatal(err)
 	}
-	if got := mustRun(t, f.gate, "rev-parse", f.anchorRef()); got != tag {
-		t.Fatalf("peelable-tag anchor changed: got %s, want %s", got, tag)
-	}
-	if f.custodyReturned() {
-		t.Fatal("peelable-tag anchor returned custody")
-	}
-}
-
-func TestInspectDoesNotAdvertiseRecoveryFromLooseObjectWithoutUsableGate(t *testing.T) {
-	t.Parallel()
-
-	f := newRecoverFixture(t, types.RunCancelled)
-	mustRun(t, f.local, "fetch", f.gate, f.preserved)
 	f.service.GateDir = filepath.Join(t.TempDir(), "missing-gate.git")
 
 	state := f.service.InspectCached(f.ctx)
-	if state.Safety != "blocked_recover_preserved_head_invalid" {
-		t.Fatalf("unavailable-gate safety = %q", state.Safety)
+	assertManualReconciliationOffer(t, state)
+	kept := f.service.Recover(f.ctx, true)
+	if kept.Recovered || kept.Safety != "blocked_recover_gate_unavailable" {
+		t.Fatalf("keep-local with unavailable gate = %#v", kept)
 	}
-	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
-		t.Fatalf("loose-object-only next action = %#v", state.NextAction)
-	}
-	if state.NextAction.Code == "recover_custody" {
-		t.Fatal("a locally present object advertised recovery even though the behind branch still requires gate evidence")
-	}
-}
-
-func TestInspectDoesNotLabelLocallyPresentDivergedHeadMissing(t *testing.T) {
-	t.Parallel()
-
-	f := newRecoverFixture(t, types.RunCancelled)
-	mustRun(t, f.local, "fetch", f.gate, f.preserved)
-	mustWrite(t, filepath.Join(f.local, "diverged.txt"), "diverged\n")
-	mustRun(t, f.local, "add", "diverged.txt")
-	mustRun(t, f.local, "commit", "-m", "diverged")
-	f.service.GateDir = ""
-
-	state := f.service.InspectCached(f.ctx)
-	if state.Safety != "blocked_recover_preserved_head_invalid" {
-		t.Fatalf("locally-present divergence safety = %q", state.Safety)
-	}
-	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
-		t.Fatalf("locally-present divergence next action = %#v", state.NextAction)
+	if f.custodyReturned() {
+		t.Fatal("unavailable gate stamped custody")
 	}
 }
 
@@ -1657,6 +2155,27 @@ func TestRecoverConcurrentGatePushLosesCleanly(t *testing.T) {
 	}
 }
 
+func TestRecoverKeepLocalRevalidatesLocalHeadBeforeStamping(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, strings.Repeat("f", 40)); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted)
+	f.service.beforeGateReset = func() {
+		mustRun(t, f.local, "update-ref", "refs/heads/feature/recover", f.base, f.submitted)
+	}
+
+	state := f.service.Recover(f.ctx, true)
+	if state.Recovered || state.Safety != "blocked_recover_assumptions_changed" {
+		t.Fatalf("recovery after local head change = %#v", state)
+	}
+	if f.custodyReturned() {
+		t.Fatal("changed local head stamped custody")
+	}
+}
+
 func TestRecoverRetryDoesNotOverwriteIndependentGateAnchor(t *testing.T) {
 	t.Parallel()
 
@@ -1791,6 +2310,94 @@ func (f *recoverFixture) localAnchorRef() string {
 	return "refs/no-mistakes/recover-local/" + f.run.ID
 }
 
+func TestRecoverRebasedPreservedHeadReconcilesSubmittedGate(t *testing.T) {
+	t.Parallel()
+
+	f := newRebasedRecoverFixture(t, types.RunFailed)
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+
+	state := f.service.Recover(f.ctx, false)
+	if !state.Recovered || !state.Changed || state.State != StateCustodyReturned {
+		t.Fatalf("shutdown recovery = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("recovered local branch = %s, want %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("reconciled gate branch = %s, want %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryGateRef(f.run.ID)); got != f.submitted {
+		t.Fatalf("pre-recovery gate head = %s, want %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.localAnchorRef()); got != f.submitted {
+		t.Fatalf("pre-recovery local head = %s, want %s", got, f.submitted)
+	}
+}
+
+func TestRecoverRebasedPreservedHeadRefusesConflictingGateEvidence(t *testing.T) {
+	t.Parallel()
+
+	f := newRebasedRecoverFixture(t, types.RunFailed)
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+	mustRun(t, f.gate, "update-ref", custody.RecoveryGateRef(f.run.ID), f.base)
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Changed || state.Safety != "blocked_recover_gate_evidence" {
+		t.Fatalf("conflicting gate evidence recovery = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("conflicting evidence moved local HEAD = %s, want %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+		t.Fatalf("conflicting evidence moved gate branch = %s, want %s", got, f.submitted)
+	}
+	if f.custodyReturned() {
+		t.Fatal("conflicting gate evidence stamped custody")
+	}
+}
+
+func TestRecoverRebasedPreservedHeadLosesGateRaceWithoutLosingWork(t *testing.T) {
+	t.Parallel()
+
+	f := newRebasedRecoverFixture(t, types.RunFailed)
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+	var racingHead string
+	f.service.beforeGateReset = func() {
+		writer := filepath.Join(t.TempDir(), "gate-racer")
+		mustRun(t, filepath.Dir(writer), "-c", "core.autocrlf=false", "clone", f.gate, writer)
+		configureIdentity(t, writer)
+		mustRun(t, writer, "checkout", "feature/recover")
+		mustWrite(t, filepath.Join(writer, "racing.txt"), "concurrent gate work\n")
+		mustRun(t, writer, "add", "racing.txt")
+		mustRun(t, writer, "commit", "-m", "concurrent gate work")
+		racingHead = mustRun(t, writer, "rev-parse", "HEAD")
+		mustRun(t, writer, "push", "origin", "HEAD:refs/heads/feature/recover")
+	}
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || !state.Changed || state.Safety != "blocked_recover_gate_race" {
+		t.Fatalf("racing gate recovery = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("safely adopted local head = %s, want %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != racingHead {
+		t.Fatalf("gate race was overwritten: got %s, want %s", got, racingHead)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.localAnchorRef()); got != f.submitted {
+		t.Fatalf("pre-recovery local work was not anchored: got %s, want %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryGateRef(f.run.ID)); got != f.submitted {
+		t.Fatalf("pre-race gate head was not anchored: got %s, want %s", got, f.submitted)
+	}
+	if f.custodyReturned() {
+		t.Fatal("racing gate update stamped custody")
+	}
+}
+
 // TestRecoverRebasedPreservedHeadAdoptsWithoutEscalating is the regression for
 // the over-escalating custody return: a cancelled validation whose preserved
 // pipeline head is the operator's own work rebased onto a newer base loses
@@ -1839,154 +2446,6 @@ func TestRecoverRebasedPreservedHeadAdoptsWithoutEscalating(t *testing.T) {
 	}
 	if !f.custodyReturned() {
 		t.Fatal("custody not stamped")
-	}
-}
-
-// TestRecoverRebasedPreservedHeadReconcilesSubmittedGate models shutdown
-// terminalization: the detached run worktree reached a safely rebased head,
-// but the gate branch itself still points at the submitted head. Recovery must
-// settle both refs before returning custody; otherwise the next ordinary push
-// of the recovered branch is rejected as a non-fast-forward.
-func TestRecoverRebasedPreservedHeadReconcilesSubmittedGate(t *testing.T) {
-	t.Parallel()
-
-	f := newRebasedRecoverFixture(t, types.RunFailed)
-	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
-	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
-
-	state := f.service.Recover(f.ctx, false)
-	if !state.Recovered || !state.Changed || state.State != StateCustodyReturned {
-		t.Fatalf("shutdown recovery = %#v", state)
-	}
-	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
-		t.Fatalf("recovered local branch = %s, want %s", got, f.preserved)
-	}
-	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
-		t.Fatalf("reconciled gate branch = %s, want %s", got, f.preserved)
-	}
-	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryGateRef(f.run.ID)); got != f.submitted {
-		t.Fatalf("pre-recovery gate head = %s, want submitted %s", got, f.submitted)
-	}
-	if got := mustRun(t, f.local, "rev-parse", f.localAnchorRef()); got != f.submitted {
-		t.Fatalf("pre-recovery local head = %s, want submitted %s", got, f.submitted)
-	}
-}
-
-func TestRecoverRebasedPreservedHeadRefusesConflictingGateEvidence(t *testing.T) {
-	t.Parallel()
-
-	f := newRebasedRecoverFixture(t, types.RunFailed)
-	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
-	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
-	mustRun(t, f.gate, "update-ref", custody.RecoveryGateRef(f.run.ID), f.base)
-
-	state := f.service.Recover(f.ctx, false)
-	if state.Recovered || state.Changed || state.Safety != "blocked_recover_gate_evidence" {
-		t.Fatalf("conflicting gate evidence recovery = %#v", state)
-	}
-	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
-		t.Fatalf("conflicting evidence moved local HEAD = %s, want %s", got, f.submitted)
-	}
-	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
-		t.Fatalf("conflicting evidence moved gate branch = %s, want %s", got, f.submitted)
-	}
-	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryGateRef(f.run.ID)); got != f.base {
-		t.Fatalf("conflicting evidence was overwritten: got %s, want %s", got, f.base)
-	}
-	if f.custodyReturned() {
-		t.Fatal("conflicting gate evidence stamped custody")
-	}
-}
-
-func TestRecoverRebasedPreservedHeadLosesGateRaceWithoutLosingWork(t *testing.T) {
-	t.Parallel()
-
-	f := newRebasedRecoverFixture(t, types.RunFailed)
-	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
-	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
-	var racingHead string
-	f.service.beforeGateReset = func() {
-		writer := filepath.Join(t.TempDir(), "gate-racer")
-		mustRun(t, filepath.Dir(writer), "-c", "core.autocrlf=false", "clone", f.gate, writer)
-		configureIdentity(t, writer)
-		mustRun(t, writer, "checkout", "feature/recover")
-		mustWrite(t, filepath.Join(writer, "racing.txt"), "concurrent gate work\n")
-		mustRun(t, writer, "add", "racing.txt")
-		mustRun(t, writer, "commit", "-m", "concurrent gate work")
-		racingHead = mustRun(t, writer, "rev-parse", "HEAD")
-		mustRun(t, writer, "push", "origin", "HEAD:refs/heads/feature/recover")
-	}
-
-	state := f.service.Recover(f.ctx, false)
-	if state.Recovered || !state.Changed || state.Safety != "blocked_recover_gate_race" {
-		t.Fatalf("racing gate recovery = %#v", state)
-	}
-	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
-		t.Fatalf("safely adopted local head = %s, want %s", got, f.preserved)
-	}
-	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != racingHead {
-		t.Fatalf("gate race was overwritten: got %s, want %s", got, racingHead)
-	}
-	if got := mustRun(t, f.local, "rev-parse", f.localAnchorRef()); got != f.submitted {
-		t.Fatalf("pre-recovery local work was not anchored: got %s, want %s", got, f.submitted)
-	}
-	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryGateRef(f.run.ID)); got != f.submitted {
-		t.Fatalf("pre-race gate head was not anchored: got %s, want %s", got, f.submitted)
-	}
-	if got := mustRun(t, f.gate, "rev-parse", f.anchorRef()); got != f.preserved {
-		t.Fatalf("pipeline head was not preserved: got %s, want %s", got, f.preserved)
-	}
-	if f.custodyReturned() {
-		t.Fatal("racing gate update stamped custody")
-	}
-}
-
-func TestInspectAdvertisesRecoveryForAnchoredRebasedHead(t *testing.T) {
-	t.Parallel()
-
-	f := newRebasedRecoverFixture(t, types.RunCancelled)
-	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
-	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
-
-	state := f.service.InspectCached(f.ctx)
-	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
-		t.Fatalf("anchored rebased head did not advertise recovery = %#v", state)
-	}
-}
-
-func TestInspectAdvertisesRecoveryWithSplitRebasedObjects(t *testing.T) {
-	t.Parallel()
-
-	for _, anchored := range []bool{false, true} {
-		name := "dangling"
-		if anchored {
-			name = "anchored"
-		}
-		t.Run(name, func(t *testing.T) {
-			f := newRebasedRecoverFixture(t, types.RunCancelled)
-			mustRun(t, f.gate, "reflog", "expire", "--expire=now", "--all")
-			mustRun(t, f.gate, "gc", "--prune=now")
-			if _, err := gitpkg.Run(f.ctx, f.gate, "cat-file", "-e", f.submitted); err == nil {
-				t.Fatal("fixture retained the local rebased head in the gate")
-			}
-			if anchored {
-				mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
-			}
-			gateMain := mustRun(t, f.gate, "rev-parse", "refs/heads/main")
-			mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", gateMain, f.preserved)
-			if _, err := gitpkg.Run(f.ctx, f.local, "cat-file", "-e", f.preserved); err == nil {
-				t.Fatal("fixture retained the preserved head in the local repository")
-			}
-
-			state := f.service.InspectCached(f.ctx)
-			if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
-				t.Fatalf("split-object state did not advertise recovery = %#v", state)
-			}
-			recovered := f.service.Recover(f.ctx, false)
-			if !recovered.Recovered || !recovered.Changed {
-				t.Fatalf("split-object recovery = %#v", recovered)
-			}
-		})
 	}
 }
 
@@ -2206,6 +2665,14 @@ func TestRecoverIncompleteAdoptionDoesNotStampStaleWorktree(t *testing.T) {
 	}
 	if f.custodyReturned() {
 		t.Fatal("incomplete adoption stamped custody")
+	}
+
+	kept := f.service.Recover(f.ctx, true)
+	if kept.Recovered || kept.Changed || kept.Safety != "blocked_recover_incomplete_adoption" {
+		t.Fatalf("keep-local bypassed incomplete adoption: %#v", kept)
+	}
+	if f.custodyReturned() {
+		t.Fatal("keep-local stamped incomplete adoption custody")
 	}
 }
 

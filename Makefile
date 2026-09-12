@@ -13,15 +13,27 @@ LDFLAGS := -X github.com/kunchenguid/no-mistakes/internal/buildinfo.Version=$(VE
            -X github.com/kunchenguid/no-mistakes/internal/buildinfo.TelemetryHost=$(UMAMI_HOST) \
            -X github.com/kunchenguid/no-mistakes/internal/buildinfo.TelemetryWebsiteID=$(UMAMI_WEBSITE_ID)
 
-.PHONY: build dist install test e2e e2e-record lint fmt clean docs docs-build docs-preview demo skill skill-check
+.PHONY: build dist install test e2e e2e-record lint fmt clean docs docs-build docs-preview demo skill skill-check verify-fork-safety
+
+FORK_SAFETY_ANCESTORS := \
+	854b16fb88a5c950033baaf319d22d595f8e9e53 \
+	0e51f7533097a136c3a1910182a2d426ac1bc9f3 \
+	dfefd3403135cf3bdaeb3e2d3d2e177d1488ae35 \
+	53ceb81ea6920e449684c2d0c275006e7ed99e8c
 
 DIST_DIR ?= dist
 INSTALL_BIN := $(shell go env GOPATH)/bin/no-mistakes
 
-build:
+verify-fork-safety:
+	@for commit in $(FORK_SAFETY_ANCESTORS); do \
+		git cat-file -e "$$commit^{commit}" 2>/dev/null || { echo "required fork/upstream ancestor $$commit is unavailable; use a full-history checkout" >&2; exit 1; }; \
+		git merge-base --is-ancestor "$$commit" HEAD || { echo "refusing build: HEAD dropped required fork/upstream ancestor $$commit" >&2; exit 1; }; \
+	done
+
+build: verify-fork-safety
 	go build -ldflags "$(LDFLAGS)" -o bin/no-mistakes ./cmd/no-mistakes
 
-dist:
+dist: verify-fork-safety
 	rm -rf $(DIST_DIR)
 	mkdir -p $(DIST_DIR)
 	for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64 windows/arm64; do \
@@ -85,7 +97,7 @@ skill:
 skill-check:
 	go run ./cmd/genskill --check
 
-lint: skill-check
+lint: skill-check verify-fork-safety
 	go vet ./...
 
 fmt:

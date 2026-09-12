@@ -109,3 +109,49 @@ func TestParseIntentPushOptionsNone(t *testing.T) {
 		t.Fatalf("parseIntentPushOptions(no intent) = %q, want empty", got)
 	}
 }
+
+func TestProofAndPRBaseBranchPushOptionsRoundTrip(t *testing.T) {
+	nonce := "request-7f3"
+	generation := "generation-7"
+	nonceOpt := formatLaunchNoncePushOption(nonce)
+	generationOpt := formatValidationGenerationPushOption(generation)
+	baseBranchOpt := formatPRBaseBranchPushOption("epic/feature")
+	gotNonce, err := parseLaunchNoncePushOptions([]string{nonceOpt, baseBranchOpt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotGeneration, err := parseValidationGenerationPushOptions([]string{generationOpt, baseBranchOpt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotBaseBranch, err := parsePRBaseBranchPushOptions([]string{nonceOpt, generationOpt, baseBranchOpt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotNonce != nonce || gotGeneration != generation || gotBaseBranch != "epic/feature" {
+		t.Fatalf("push options = nonce %q generation %q base branch %q", gotNonce, gotGeneration, gotBaseBranch)
+	}
+	if _, err := parseValidationGenerationPushOptions([]string{generationOpt, formatValidationGenerationPushOption("generation-8")}); err == nil {
+		t.Fatal("conflicting validation generations were accepted")
+	}
+}
+
+func TestUnsignedPushOptionIsExplicitAndStrict(t *testing.T) {
+	if got := formatUnsignedPushOption(false); got != "" {
+		t.Fatalf("false option = %q", got)
+	}
+	opt := formatUnsignedPushOption(true)
+	got, err := parseUnsignedPushOptions([]string{"ci.skip", opt})
+	if err != nil || !got {
+		t.Fatalf("round trip = %v, %v", got, err)
+	}
+	for _, options := range [][]string{
+		{"no-mistakes.unsigned=false"},
+		{opt, opt},
+		{"no-mistakes.unsigned=yes"},
+	} {
+		if _, err := parseUnsignedPushOptions(options); err == nil {
+			t.Fatalf("accepted malformed unsigned options %v", options)
+		}
+	}
+}

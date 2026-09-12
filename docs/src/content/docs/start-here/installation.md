@@ -44,6 +44,8 @@ make install
 
 `make build` embeds the telemetry host from `NO_MISTAKES_UMAMI_HOST` in a repo-local `.env` first, then `UMAMI_HOST` from the shell, then the default self-hosted host. It embeds the telemetry website ID from `NO_MISTAKES_UMAMI_WEBSITE_ID` in `.env` first, then `UMAMI_WEBSITE_ID` from the shell, then the default website ID.
 
+The PixelOven release line also verifies Git ancestry before `make build`, `make dist`, lint, and every release artifact build. A releasable checkout must contain the fork's signing-policy, preserved-head, and transactional gate-recovery ancestors (`854b16f`, `0e51f75`, and `dfefd34`) plus reconciled upstream base `53ceb81`. Use a full-history checkout. A higher semantic version alone is not evidence that these safety changes are present; the build fails when any required commit is unavailable or is not an ancestor of `HEAD`.
+
 ## Prerequisites
 
 - **git** - required
@@ -73,6 +75,7 @@ This downloads the latest release from GitHub, verifies the SHA-256 checksum, at
 `no-mistakes update` installs the latest stable release.
 Use `no-mistakes update --beta` to opt into prereleases and install the latest beta when one is newer than the current stable release.
 Use `no-mistakes update -y` to answer yes to the daemon-executable-mismatch prompt described below.
+Version discovery uses the GitHub release-asset CDN rather than the rate-limited REST API; see [`no-mistakes update`](/no-mistakes/reference/cli/#no-mistakes-update).
 
 Because `update` installs the latest official release binary, it installs a binary with the default self-hosted telemetry host and website ID. Disable telemetry with `NO_MISTAKES_TELEMETRY=0`, or override the host and website ID with `NO_MISTAKES_UMAMI_HOST` and `NO_MISTAKES_UMAMI_WEBSITE_ID`.
 

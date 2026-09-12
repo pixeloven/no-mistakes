@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -114,6 +115,184 @@ func TestPushReceivedTracksRunTelemetry(t *testing.T) {
 	}
 }
 
+func TestProofLaunchReceiptBindsIndependentGenerationAndFirstObserver(t *testing.T) {
+	step := &mockPassStep{name: types.StepReview}
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step { return []pipeline.Step{step} })
+	repo, headSHA := setupTestGitRepo(t, p, d, "proof-launch-repo")
+
+	call := func(nonce, generation, intent string, unsigned ...bool) (ipc.StartFreshRunResult, error) {
+		client, err := ipc.Dial(p.Socket())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		var result ipc.StartFreshRunResult
+		err = client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
+			RepoID: repo.ID, Branch: "main", HeadSHA: headSHA, Intent: intent,
+			LaunchNonce: nonce, ValidationGeneration: generation,
+			Unsigned: len(unsigned) > 0 && unsigned[0],
+		}, &result)
+		return result, err
+	}
+
+	const generation = "generation-001"
+	intent := "persist these exact bytes\nprivate validation intent"
+	first, err := call("nonce-1", generation, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Receipt.Disposition != "created" || first.Receipt.RunID == "" ||
+		first.Receipt.LaunchNonce != "nonce-1" || first.Receipt.ValidationGeneration != generation ||
+		first.Receipt.Branch != "main" || first.Receipt.HeadSHA != headSHA ||
+		first.Receipt.SubmittedHeadSHA != headSHA || first.Receipt.IntentDigest != digestIntent(intent) {
+		t.Fatalf("first receipt = %#v", first.Receipt)
+	}
+	encoded, err := json.Marshal(first.Receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "private validation intent") || strings.Contains(string(encoded), intent) {
+		t.Fatalf("launch receipt exposed raw intent: %s", encoded)
+	}
+	run, err := d.GetRun(first.Receipt.RunID)
+	if err != nil || run == nil || run.LaunchNonce == nil || *run.LaunchNonce != "nonce-1" ||
+		run.LaunchValidationGeneration == nil || *run.LaunchValidationGeneration != generation ||
+		run.LaunchIntentDigest == nil || *run.LaunchIntentDigest != digestIntent(intent) ||
+		run.Intent == nil || *run.Intent != intent || run.LaunchReceiptClaimedAt == nil {
+		t.Fatalf("persisted proof run = %#v, err=%v", run, err)
+	}
+
+	replay, err := call("nonce-1", generation, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.Receipt.RunID != first.Receipt.RunID || replay.Receipt.Disposition != "reused" {
+		t.Fatalf("replay receipt = %#v, first = %#v", replay.Receipt, first.Receipt)
+	}
+	logLaunchEvidence(t, "first-and-replay", []ipc.LaunchReceipt{first.Receipt, replay.Receipt})
+	if _, err := call("nonce-1", "generation-002", intent); err == nil {
+		t.Fatal("changed validation generation reused a nonce")
+	}
+	if _, err := call("nonce-1", generation, intent+" changed"); err == nil {
+		t.Fatal("changed intent reused a nonce")
+	}
+	if _, err := call("nonce-1", generation, intent, true); err == nil || !strings.Contains(err.Error(), "signing choice") {
+		t.Fatalf("changed unsigned choice reused a nonce: %v", err)
+	}
+}
+
+func TestProofLaunchReceiptPushCrashWindowConcurrentClaimsAndImmutableReplay(t *testing.T) {
+	step := &mockPassStep{name: types.StepReview}
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step { return []pipeline.Step{step} })
+	repo, headSHA := setupTestGitRepo(t, p, d, "proof-push-repo")
+	const generation = "generation-push-001"
+	const intent = "opaque push intent"
+	gitCmd(t, repo.WorkingPath, "branch", "review/base")
+	gitCmd(t, repo.WorkingPath, "push", "gate", "review/base:refs/heads/review/base")
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var pushed ipc.PushReceivedResult
+	if err := client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir(repo.ID), Ref: "refs/heads/main",
+		Old: "0000000000000000000000000000000000000000", New: headSHA,
+		Intent: intent, LaunchNonce: "push-nonce", ValidationGeneration: generation,
+		PRBaseBranch: " review/base ",
+	}, &pushed); err != nil {
+		t.Fatal(err)
+	}
+	if pushed.RunID == "" {
+		t.Fatalf("push result = %#v", pushed)
+	}
+	if stored, err := d.GetRun(pushed.RunID); err != nil || stored == nil || stored.LaunchReceiptClaimedAt != nil {
+		t.Fatalf("push receipt claim state = %#v, err=%v", stored, err)
+	}
+	var freshMismatch ipc.StartFreshRunResult
+	err = client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
+		RepoID: repo.ID, Branch: "main", HeadSHA: headSHA, Intent: intent,
+		LaunchNonce: "push-nonce", ValidationGeneration: generation, PRBaseBranch: "other/base",
+	}, &freshMismatch)
+	if err == nil || !strings.Contains(err.Error(), "different pr base branch") {
+		t.Fatalf("mismatched fresh launch err = %v, want base mismatch", err)
+	}
+
+	var mismatched ipc.ClaimLaunchReceiptResult
+	err = client.Call(ipc.MethodClaimLaunchReceipt, &ipc.ClaimLaunchReceiptParams{
+		RepoID: repo.ID, Branch: "main", LaunchNonce: "push-nonce",
+		SubmittedHeadSHA: headSHA, ValidationGeneration: generation, IntentDigest: digestIntent(intent),
+		PRBaseBranch: "other/base",
+	}, &mismatched)
+	if err == nil || !strings.Contains(err.Error(), "different pr base branch") {
+		t.Fatalf("mismatched base claim err = %v, want base mismatch", err)
+	}
+	logLaunchEvidence(t, "base-conflict", err.Error())
+	stored, err := d.GetRun(pushed.RunID)
+	if err != nil || stored == nil || stored.LaunchReceiptClaimedAt != nil {
+		t.Fatalf("mismatched base claim consumed first receipt: run=%#v err=%v", stored, err)
+	}
+
+	const callers = 4
+	results := make(chan ipc.StartFreshRunResult, callers)
+	errs := make(chan error, callers)
+	for range callers {
+		go func() {
+			c, err := ipc.Dial(p.Socket())
+			if err == nil {
+				defer c.Close()
+				var result ipc.StartFreshRunResult
+				err = c.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
+					RepoID: repo.ID, Branch: "main", HeadSHA: headSHA, Intent: intent,
+					LaunchNonce: "push-nonce", ValidationGeneration: generation,
+				}, &result)
+				results <- result
+			}
+			errs <- err
+		}()
+	}
+	created := 0
+	for range callers {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		result := <-results
+		if result.Receipt.RunID != pushed.RunID {
+			t.Fatalf("concurrent receipt run = %q, want %q", result.Receipt.RunID, pushed.RunID)
+		}
+		if result.Receipt.Disposition == "created" {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("created receipts = %d, want 1", created)
+	}
+
+	gitCmd(t, repo.WorkingPath, "commit", "--allow-empty", "-m", "advance gate")
+	gitCmd(t, repo.WorkingPath, "push", "gate", "HEAD:refs/heads/main")
+	if err := d.UpdateRunHeadSHA(pushed.RunID, "pipeline-fix-head"); err != nil {
+		t.Fatal(err)
+	}
+	var replay ipc.StartFreshRunResult
+	if err := client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
+		RepoID: repo.ID, Branch: "main", HeadSHA: headSHA, Intent: intent,
+		LaunchNonce: "push-nonce", ValidationGeneration: generation,
+		PRBaseBranch: " review/base ",
+	}, &replay); err != nil {
+		t.Fatal(err)
+	}
+	if replay.Receipt.HeadSHA != headSHA || replay.Receipt.SubmittedHeadSHA != headSHA || replay.Receipt.Disposition != "reused" {
+		t.Fatalf("immutable replay receipt = %#v, want submitted head %q", replay.Receipt, headSHA)
+	}
+	stored, err = d.GetRun(pushed.RunID)
+	if err != nil || stored == nil || stored.PRBaseBranch == nil || *stored.PRBaseBranch != "review/base" {
+		t.Fatalf("persisted proof base branch = %#v, err=%v", stored, err)
+	}
+	logLaunchEvidence(t, "advanced-head-replay", replay.Receipt)
+	logLaunchEvidence(t, "persisted-base", *stored.PRBaseBranch)
+}
+
 func TestPushReceivedSkipStepsConfiguresExecutor(t *testing.T) {
 	review := &mockPassStep{name: types.StepReview}
 	testStep := &mockPassStep{name: types.StepTest}
@@ -168,7 +347,10 @@ type commitSigningPolicyStep struct {
 
 func (s *commitSigningPolicyStep) Name() types.StepName { return types.StepReview }
 func (s *commitSigningPolicyStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
-	policy, err := git.Run(sctx.Ctx, sctx.WorkDir, "config", "--get", "commit.gpgsign")
+	if sctx.Run.CommitSigningPolicy == nil {
+		return nil, fmt.Errorf("missing run signing policy")
+	}
+	policy, err := git.CommandCommitSigningPolicy(*sctx.Run.CommitSigningPolicy, sctx.Run.CommitSigningEffective)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +360,7 @@ func (s *commitSigningPolicyStep) Execute(sctx *pipeline.StepContext) (*pipeline
 	if _, err := git.Run(sctx.Ctx, sctx.WorkDir, "add", "generated-fix.txt"); err != nil {
 		return nil, err
 	}
-	if _, err := git.Run(sctx.Ctx, sctx.WorkDir, "commit", "-m", "pipeline review fix"); err != nil {
+	if _, err := git.RunWithSigningPolicy(sctx.Ctx, sctx.WorkDir, *sctx.Run.CommitSigningPolicy, sctx.Run.CommitSigningEffective, "commit", "-m", "pipeline review fix"); err != nil {
 		return nil, err
 	}
 	s.observed <- policy
@@ -191,7 +373,10 @@ type signingPolicyObserverStep struct {
 
 func (s *signingPolicyObserverStep) Name() types.StepName { return types.StepReview }
 func (s *signingPolicyObserverStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
-	policy, err := git.Run(sctx.Ctx, sctx.WorkDir, "config", "--worktree", "--bool", "--get", "commit.gpgsign")
+	if sctx.Run.CommitSigningPolicy == nil {
+		return nil, fmt.Errorf("missing run signing policy")
+	}
+	policy, err := git.CommandCommitSigningPolicy(*sctx.Run.CommitSigningPolicy, sctx.Run.CommitSigningEffective)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +391,8 @@ func TestPushReceivedCarriesExplicitUnsignedPolicyIntoRunWorktree(t *testing.T) 
 	})
 
 	repo, headSHA := setupTestGitRepo(t, p, d, "unsigned-commit-policy-repo")
-	gitCmd(t, repo.WorkingPath, "config", "commit.gpgsign", "false")
+	gitCmd(t, repo.WorkingPath, "config", "commit.gpgsign", "true")
+	beforePolicy := gitOutput(t, repo.WorkingPath, "config", "--worktree", "--get", "commit.gpgsign")
 	if err := git.IsolateHooksPath(context.Background(), p.RepoDir(repo.ID)); err != nil {
 		t.Fatalf("isolate gate worktree config: %v", err)
 	}
@@ -221,7 +407,7 @@ func TestPushReceivedCarriesExplicitUnsignedPolicyIntoRunWorktree(t *testing.T) 
 	defer client.Close()
 	var result ipc.PushReceivedResult
 	if err := client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
-		Gate: p.RepoDir(repo.ID), Ref: "refs/heads/main", New: headSHA,
+		Gate: p.RepoDir(repo.ID), Ref: "refs/heads/main", New: headSHA, Unsigned: true,
 	}, &result); err != nil {
 		t.Fatal(err)
 	}
@@ -236,10 +422,15 @@ func TestPushReceivedCarriesExplicitUnsignedPolicyIntoRunWorktree(t *testing.T) 
 	}
 	if run := waitForRunTerminalState(t, d, result.RunID); run.Status != types.RunCompleted {
 		t.Fatalf("run status = %q, want %q: %v", run.Status, types.RunCompleted, run.Error)
+	} else if run.CommitSigningPolicy == nil || *run.CommitSigningPolicy != "false" || run.CommitSigningEffective == nil || *run.CommitSigningEffective || !run.LaunchUnsigned {
+		t.Fatalf("frozen unsigned policy = policy %v effective %v explicit %v", run.CommitSigningPolicy, run.CommitSigningEffective, run.LaunchUnsigned)
+	}
+	if afterPolicy := gitOutput(t, repo.WorkingPath, "config", "--worktree", "--get", "commit.gpgsign"); afterPolicy != beforePolicy {
+		t.Fatalf("admission changed persistent signing configuration from %q to %q", beforePolicy, afterPolicy)
 	}
 }
 
-func TestPushReceivedRejectsSharedSigningPolicyWithoutWorktreeConfig(t *testing.T) {
+func TestPushReceivedDefaultPreservesSignerWithoutWorktreeConfig(t *testing.T) {
 	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
 		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
 	})
@@ -247,7 +438,7 @@ func TestPushReceivedRejectsSharedSigningPolicyWithoutWorktreeConfig(t *testing.
 	repo, headSHA := setupTestGitRepo(t, p, d, "shared-signing-policy-repo")
 	gitCmd(t, repo.WorkingPath, "config", "--worktree", "--unset-all", "commit.gpgsign")
 	gitCmd(t, repo.WorkingPath, "config", "--local", "extensions.worktreeConfig", "false")
-	gitCmd(t, repo.WorkingPath, "config", "--local", "commit.gpgsign", "false")
+	gitCmd(t, repo.WorkingPath, "config", "--local", "commit.gpgsign", "true")
 
 	client, err := ipc.Dial(p.Socket())
 	if err != nil {
@@ -258,8 +449,12 @@ func TestPushReceivedRejectsSharedSigningPolicyWithoutWorktreeConfig(t *testing.
 	err = client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
 		Gate: p.RepoDir(repo.ID), Ref: "refs/heads/main", New: headSHA,
 	}, &result)
-	if err == nil || !strings.Contains(err.Error(), "extensions.worktreeConfig=true") {
-		t.Fatalf("expected actionable worktree config rejection, got %v", err)
+	if err != nil {
+		t.Fatalf("default admission required persistent signing configuration: %v", err)
+	}
+	run := waitForRunTerminalState(t, d, result.RunID)
+	if run.CommitSigningPolicy == nil || *run.CommitSigningPolicy != "true" || run.CommitSigningEffective == nil || !*run.CommitSigningEffective || run.LaunchUnsigned {
+		t.Fatalf("default signing policy = policy %v effective %v explicit %v", run.CommitSigningPolicy, run.CommitSigningEffective, run.LaunchUnsigned)
 	}
 }
 
@@ -285,8 +480,8 @@ func TestPushReceivedPersistsAndRerunInheritsEffectiveSigningForUnsetPolicy(t *t
 		t.Fatal(err)
 	}
 	firstRun := waitForRunTerminalState(t, d, first.RunID)
-	if firstRun.CommitSigningPolicy == nil || *firstRun.CommitSigningPolicy != "" {
-		t.Fatalf("explicit signing policy = %v, want unset", firstRun.CommitSigningPolicy)
+	if firstRun.CommitSigningPolicy == nil || *firstRun.CommitSigningPolicy != "true" {
+		t.Fatalf("signing policy = %v, want true", firstRun.CommitSigningPolicy)
 	}
 	if firstRun.CommitSigningEffective == nil || !*firstRun.CommitSigningEffective {
 		t.Fatalf("effective signing policy = %v, want true", firstRun.CommitSigningEffective)
@@ -300,8 +495,8 @@ func TestPushReceivedPersistsAndRerunInheritsEffectiveSigningForUnsetPolicy(t *t
 		t.Fatal(err)
 	}
 	rerunState := waitForRunTerminalState(t, d, rerun.RunID)
-	if rerunState.CommitSigningPolicy == nil || *rerunState.CommitSigningPolicy != "" {
-		t.Fatalf("rerun explicit signing policy = %v, want unset", rerunState.CommitSigningPolicy)
+	if rerunState.CommitSigningPolicy == nil || *rerunState.CommitSigningPolicy != "true" {
+		t.Fatalf("rerun signing policy = %v, want inherited true", rerunState.CommitSigningPolicy)
 	}
 	if rerunState.CommitSigningEffective == nil || !*rerunState.CommitSigningEffective {
 		t.Fatalf("rerun effective signing policy = %v, want inherited true", rerunState.CommitSigningEffective)
@@ -824,7 +1019,7 @@ func TestRerunInheritsIntentAndSigningPolicyFromSelectedRun(t *testing.T) {
 		Summary: "newer unrelated requirements",
 		Source:  db.RunIntentSourceAgent,
 		Score:   1,
-	})
+	}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -861,6 +1056,152 @@ func TestRerunInheritsIntentAndSigningPolicyFromSelectedRun(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("rerun did not observe its inherited signing policy")
+	}
+}
+
+func TestRerunInheritsPRBaseBranchFromSelectedRun(t *testing.T) {
+	step := &mockPassStep{name: types.StepReview}
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{step}
+	})
+
+	repo, headSHA := setupTestGitRepo(t, p, d, "pr-base-rerun-repo")
+	workDir := repo.WorkingPath
+	gitCmd(t, workDir, "checkout", "-b", "epic/feature")
+	if err := os.WriteFile(filepath.Join(workDir, "epic.txt"), []byte("epic\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, workDir, "add", "epic.txt")
+	gitCmd(t, workDir, "commit", "-m", "epic")
+	gitCmd(t, workDir, "push", "gate", "HEAD:refs/heads/epic/feature")
+	gitCmd(t, workDir, "checkout", "main")
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var first ipc.PushReceivedResult
+	err = client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate:         p.RepoDir("pr-base-rerun-repo"),
+		Ref:          "refs/heads/main",
+		Old:          "0000000000000000000000000000000000000000",
+		New:          headSHA,
+		PRBaseBranch: "epic/feature",
+	}, &first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRun := waitForRunTerminalState(t, d, first.RunID)
+	if firstRun.PRBaseBranch == nil || *firstRun.PRBaseBranch != "epic/feature" {
+		t.Fatalf("first run PRBaseBranch = %#v, want epic/feature", firstRun.PRBaseBranch)
+	}
+
+	var rerun ipc.RerunResult
+	err = client.Call(ipc.MethodRerun, &ipc.RerunParams{
+		RepoID:        "pr-base-rerun-repo",
+		Branch:        "main",
+		PreviousRunID: first.RunID,
+	}, &rerun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := waitForRunTerminalState(t, d, rerun.RunID)
+	if got.PRBaseBranch == nil || *got.PRBaseBranch != "epic/feature" {
+		t.Fatalf("rerun PRBaseBranch = %#v, want inherited epic/feature", got.PRBaseBranch)
+	}
+}
+
+func TestRerunInheritsPRURLFromSelectedRun(t *testing.T) {
+	step := &mockPassStep{name: types.StepReview}
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{step}
+	})
+
+	_, headSHA := setupTestGitRepo(t, p, d, "pr-url-rerun-repo")
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var first ipc.PushReceivedResult
+	err = client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir("pr-url-rerun-repo"),
+		Ref:  "refs/heads/main",
+		Old:  "0000000000000000000000000000000000000000",
+		New:  headSHA,
+	}, &first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRunTerminalState(t, d, first.RunID)
+	prURL := "https://github.com/test/repo/pull/42"
+	if err := d.UpdateRunPRURL(first.RunID, prURL); err != nil {
+		t.Fatal(err)
+	}
+
+	var rerun ipc.RerunResult
+	err = client.Call(ipc.MethodRerun, &ipc.RerunParams{
+		RepoID:        "pr-url-rerun-repo",
+		Branch:        "main",
+		PreviousRunID: first.RunID,
+	}, &rerun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := waitForRunTerminalState(t, d, rerun.RunID)
+	if got.PRURL == nil || *got.PRURL != prURL {
+		t.Fatalf("rerun PRURL = %#v, want inherited %s", got.PRURL, prURL)
+	}
+}
+
+func TestRerunDoesNotInheritClosedPRURL(t *testing.T) {
+	step := &mockPassStep{name: types.StepReview}
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{step}
+	})
+
+	_, headSHA := setupTestGitRepo(t, p, d, "closed-pr-url-rerun-repo")
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var first ipc.PushReceivedResult
+	err = client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir("closed-pr-url-rerun-repo"),
+		Ref:  "refs/heads/main",
+		Old:  "0000000000000000000000000000000000000000",
+		New:  headSHA,
+	}, &first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRunTerminalState(t, d, first.RunID)
+	if err := d.UpdateRunPRURL(first.RunID, "https://github.com/test/repo/pull/42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateRunPRState(first.RunID, "closed"); err != nil {
+		t.Fatal(err)
+	}
+
+	var rerun ipc.RerunResult
+	err = client.Call(ipc.MethodRerun, &ipc.RerunParams{
+		RepoID:        "closed-pr-url-rerun-repo",
+		Branch:        "main",
+		PreviousRunID: first.RunID,
+	}, &rerun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := waitForRunTerminalState(t, d, rerun.RunID)
+	if got.PRURL != nil && *got.PRURL != "" {
+		t.Fatalf("rerun PRURL = %#v, want no inherit of a closed PR", got.PRURL)
 	}
 }
 
@@ -1137,4 +1478,133 @@ func TestPushReceivedDemoModeBypassesAgentResolution(t *testing.T) {
 	if step.execCnt.Load() == 0 {
 		t.Error("mock step was never executed")
 	}
+}
+
+func TestProofLaunchFallbackReturnsReusedWhenObserverClaimsDuringSetup(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		close(entered)
+		<-release
+		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+	})
+	defer unblock()
+	repo, head := setupTestGitRepo(t, p, d, "claim-during-setup")
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	const intent = "claim while the fallback initializes"
+	var fresh ipc.StartFreshRunResult
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
+			RepoID: repo.ID, Branch: "main", HeadSHA: head, Intent: intent,
+			LaunchNonce: "setup-nonce", ValidationGeneration: "generation",
+		}, &fresh)
+	}()
+	select {
+	case <-entered:
+	case err := <-done:
+		t.Fatalf("launch returned before setup: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("launch did not reach setup")
+	}
+	observer, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	var first ipc.ClaimLaunchReceiptResult
+	if err := observer.Call(ipc.MethodClaimLaunchReceipt, &ipc.ClaimLaunchReceiptParams{
+		RepoID: repo.ID, Branch: "main", SubmittedHeadSHA: head,
+		LaunchNonce: "setup-nonce", ValidationGeneration: "generation", IntentDigest: digestIntent(intent),
+	}, &first); err != nil {
+		t.Fatal(err)
+	}
+	if first.Receipt == nil || first.Receipt.Disposition != "created" {
+		t.Fatalf("first observer = %+v", first)
+	}
+	unblock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Receipt.RunID != first.Receipt.RunID || fresh.Receipt.Disposition != "reused" {
+		t.Fatalf("fallback receipt = %+v, first = %+v", fresh.Receipt, first.Receipt)
+	}
+	run := waitForRunTerminalState(t, d, fresh.Receipt.RunID)
+	if run.Status != types.RunCompleted || run.LaunchReceiptClaimedAt == nil {
+		t.Fatalf("claimed run = %+v", run)
+	}
+	logLaunchEvidence(t, "observer-and-fallback", []ipc.LaunchReceipt{*first.Receipt, fresh.Receipt})
+}
+
+func TestProofLaunchFallbackInheritsOnlyLivePRIdentity(t *testing.T) {
+	for _, state := range []string{"", "open", "closed", "merged"} {
+		t.Run("state="+state, func(t *testing.T) {
+			p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+				return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+			})
+			repo, head := setupTestGitRepo(t, p, d, "proof-pr-inheritance")
+			gitCmd(t, repo.WorkingPath, "branch", "review/base")
+			gitCmd(t, repo.WorkingPath, "push", "gate", "review/base:refs/heads/review/base")
+			client, err := ipc.Dial(p.Socket())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			launch := func(nonce, base string) *db.Run {
+				t.Helper()
+				var result ipc.StartFreshRunResult
+				if err := client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
+					RepoID: repo.ID, Branch: "main", HeadSHA: head, Intent: "preserve existing PR",
+					LaunchNonce: nonce, ValidationGeneration: "generation", PRBaseBranch: base,
+				}, &result); err != nil {
+					t.Fatal(err)
+				}
+				if result.Receipt.Disposition != "created" {
+					t.Fatalf("new nonce receipt = %+v", result.Receipt)
+				}
+				return waitForRunTerminalState(t, d, result.Receipt.RunID)
+			}
+			prior := launch("prior-nonce", "")
+			const prURL = "https://github.com/test/repo/pull/42"
+			if err := d.UpdateRunPRURL(prior.ID, prURL); err != nil {
+				t.Fatal(err)
+			}
+			if state != "" {
+				if err := d.UpdateRunPRState(prior.ID, state); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got := launch("new-nonce", " review/base ")
+			if got.ID == prior.ID || got.Status != types.RunCompleted || got.PRBaseBranch == nil || *got.PRBaseBranch != "review/base" {
+				t.Fatalf("fresh retargeted run = %+v", got)
+			}
+			if state == "closed" || state == "merged" {
+				if got.PRURL != nil && *got.PRURL != "" {
+					t.Fatalf("inherited retired PR: %s", *got.PRURL)
+				}
+			} else if got.PRURL == nil || *got.PRURL != prURL {
+				t.Fatalf("lost existing PR identity: %+v", got)
+			}
+			logLaunchEvidence(t, "persisted-pr-inheritance", map[string]any{
+				"prior_run_id": prior.ID, "prior_pr_state": state,
+				"new_run_id": got.ID, "pr_url": got.PRURL, "pr_base_branch": got.PRBaseBranch,
+			})
+		})
+	}
+}
+
+// Record only the public receipt and selected persisted launch state, never intent.
+func logLaunchEvidence(t *testing.T, label string, value any) {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("launch-evidence %s: %s", label, encoded)
 }
