@@ -1,5 +1,57 @@
 # Changelog
 
+## [1.61.0](https://github.com/pixeloven/no-mistakes/compare/v1.60.2...v1.61.0) (2026-09-12)
+
+
+### Features
+
+* **agent:** configure independent reviewer and fixer harness profiles ([#1016](https://github.com/pixeloven/no-mistakes/issues/1016)) ([94afe33](https://github.com/pixeloven/no-mistakes/commit/94afe335fa0060bccc562cd0512c2c940741d95b))
+* **axi:** add per-run PR base branch via --base-branch ([#861](https://github.com/pixeloven/no-mistakes/issues/861)) ([e08143f](https://github.com/pixeloven/no-mistakes/commit/e08143f8407681d922ad50df9bcf14906095dd57))
+* **cli:** add ci-workflow subcommand to generate GitHub Actions CI from repo config ([#984](https://github.com/pixeloven/no-mistakes/issues/984)) ([9862979](https://github.com/pixeloven/no-mistakes/commit/9862979aa6f9631ddbcd3518dfa58df2084f0ebe))
+* **daemon:** add atomic nonce-bound launch receipts ([#895](https://github.com/pixeloven/no-mistakes/issues/895)) ([f093de2](https://github.com/pixeloven/no-mistakes/commit/f093de2923ce1178812762dba61574a1d6089c8d))
+* **eval:** auto-ingest fixed CI misses ([#1012](https://github.com/pixeloven/no-mistakes/issues/1012)) ([bace158](https://github.com/pixeloven/no-mistakes/commit/bace15861522b7613944f68dcf6574d6a202e544))
+* **pipeline:** add authorization and privacy tracing to review ([#946](https://github.com/pixeloven/no-mistakes/issues/946)) ([961fbfb](https://github.com/pixeloven/no-mistakes/commit/961fbfb699f968a290351e7977afd78b48f01694))
+* **pipeline:** add live validation to the test gate ([#999](https://github.com/pixeloven/no-mistakes/issues/999)) ([f0a8858](https://github.com/pixeloven/no-mistakes/commit/f0a8858037a2e798a503cafe3a491e216a25919e))
+* **pipeline:** add opt-in protected paths for automatic commits ([#970](https://github.com/pixeloven/no-mistakes/issues/970)) ([bb821d3](https://github.com/pixeloven/no-mistakes/commit/bb821d3fb9966821834ac25ebb415b81194f20c3))
+* **pipeline:** add opt-out for generated PR intent publication ([#1018](https://github.com/pixeloven/no-mistakes/issues/1018)) ([2696771](https://github.com/pixeloven/no-mistakes/commit/2696771d8fcb772708164b5e2e381b18b69b321b))
+* **pipeline:** add simplification-first review and repair guidance ([#950](https://github.com/pixeloven/no-mistakes/issues/950)) ([72ffc59](https://github.com/pixeloven/no-mistakes/commit/72ffc59bf30fc2d2ee85627d1180323bba40aad7))
+* **pipeline:** attach media evidence to GitHub pull requests ([#934](https://github.com/pixeloven/no-mistakes/issues/934)) ([b262caa](https://github.com/pixeloven/no-mistakes/commit/b262caa9218d47a4df28e4394cba8c392383d2bb))
+* **pipeline:** prepare dependencies once per run ([#937](https://github.com/pixeloven/no-mistakes/issues/937)) ([4603016](https://github.com/pixeloven/no-mistakes/commit/4603016d04f78f360235704d73b01e2a6eaf6cac))
+* **pipeline:** unify CI failures with findings loop ([#1009](https://github.com/pixeloven/no-mistakes/issues/1009)) ([9a464c2](https://github.com/pixeloven/no-mistakes/commit/9a464c26fca7962fdd318502358cfa6cb0e1de1c))
+* **scm:** add draft pull request configuration ([#389](https://github.com/pixeloven/no-mistakes/issues/389)) ([2c84e5c](https://github.com/pixeloven/no-mistakes/commit/2c84e5c04ed5776ae902c72cc141fecb95106d17))
+
+
+### Bug Fixes
+
+* **agent:** nest OpenCode schema format under info ([#949](https://github.com/pixeloven/no-mistakes/issues/949)) ([b5a2817](https://github.com/pixeloven/no-mistakes/commit/b5a281758fc2f0a275031cb6be2273b8e67b826f))
+* **agent:** take the terminal bare JSON object for ACP agents ([#931](https://github.com/pixeloven/no-mistakes/issues/931)) ([c6ad6ce](https://github.com/pixeloven/no-mistakes/commit/c6ad6ce784761c1e7e759147e71f5a9a3b97b13c)), closes [#930](https://github.com/pixeloven/no-mistakes/issues/930)
+* **axi:** qualify automatic publication and CI skips ([#975](https://github.com/pixeloven/no-mistakes/issues/975)) ([5700d0f](https://github.com/pixeloven/no-mistakes/commit/5700d0f80b17378cf51cb0cbcee275dd00318e79))
+* **branchsync:** reconcile gate after recovery ([dfefd34](https://github.com/pixeloven/no-mistakes/commit/dfefd3403135cf3bdaeb3e2d3d2e177d1488ae35))
+* **branchsync:** recover custody from bound archives ([#954](https://github.com/pixeloven/no-mistakes/issues/954)) ([e2f575a](https://github.com/pixeloven/no-mistakes/commit/e2f575aded870cc92e58b56fd5414ab9b4cb3c2b))
+* **branchsync:** recover custody when preserved heads are missing ([#958](https://github.com/pixeloven/no-mistakes/issues/958)) ([100c1f5](https://github.com/pixeloven/no-mistakes/commit/100c1f55cffa8ded4d6f1b9a7a8a4f4cf4098ea4))
+* **cli:** clarify combined document and lint housekeeping attribution ([#941](https://github.com/pixeloven/no-mistakes/issues/941)) ([19e5db9](https://github.com/pixeloven/no-mistakes/commit/19e5db95951f013cd096267a572ce675c05add25))
+* **cli:** keep AXI attached to slow daemons ([#988](https://github.com/pixeloven/no-mistakes/issues/988)) ([e9c3b44](https://github.com/pixeloven/no-mistakes/commit/e9c3b4418e69b0e9d8ec5b38aae57242e165bab0))
+* **cli:** make untracked-file guidance safe ([#927](https://github.com/pixeloven/no-mistakes/issues/927)) ([552c22a](https://github.com/pixeloven/no-mistakes/commit/552c22adaee2c9d114e47467a03135cfc02ea2c0))
+* **cli:** show elapsed time for the active review round ([#1001](https://github.com/pixeloven/no-mistakes/issues/1001)) ([2b98e45](https://github.com/pixeloven/no-mistakes/commit/2b98e458251207404b413ec65cbf205a1cb7ff57))
+* **daemon:** refuse reruns that differ from the clean caller HEAD ([#972](https://github.com/pixeloven/no-mistakes/issues/972)) ([68ae62f](https://github.com/pixeloven/no-mistakes/commit/68ae62f18d6d2925fffaa680fec5f2c7ab0cc56d))
+* **eval:** compare replay model names only ([#991](https://github.com/pixeloven/no-mistakes/issues/991)) ([a24f920](https://github.com/pixeloven/no-mistakes/commit/a24f920b7c322d2996fca65700fafe6d4a563964))
+* **eval:** normalize provider-qualified model identities ([#982](https://github.com/pixeloven/no-mistakes/issues/982)) ([9b6d998](https://github.com/pixeloven/no-mistakes/commit/9b6d99828c8465f9eb387c92c9a44548a3bf4b71))
+* **eval:** preserve agent authentication during replay ([#968](https://github.com/pixeloven/no-mistakes/issues/968)) ([b99bce8](https://github.com/pixeloven/no-mistakes/commit/b99bce828e133e2a7682b2bc76a24f3748ff3852))
+* honor explicit local commit signing policy ([7fe829f](https://github.com/pixeloven/no-mistakes/commit/7fe829ffdff6e3e69debaeeb7fa90aa1fa32a7dd))
+* **pipeline:** ask before proceeding without a live-testable surface ([#1005](https://github.com/pixeloven/no-mistakes/issues/1005)) ([8c274f3](https://github.com/pixeloven/no-mistakes/commit/8c274f37ed2257bb76dea341354a3cc22081ca83))
+* **pipeline:** attest PR heads before pushing ([#994](https://github.com/pixeloven/no-mistakes/issues/994)) ([80ab4d8](https://github.com/pixeloven/no-mistakes/commit/80ab4d88e685d648fac7e1080c925407f2c21f00))
+* **pipeline:** distinguish intended local-main deliveries ([#1003](https://github.com/pixeloven/no-mistakes/issues/1003)) ([33327b7](https://github.com/pixeloven/no-mistakes/commit/33327b794639a230c829a0a9ac5398dc22c3e958))
+* **pipeline:** fail closed on invalid analyzer output ([#955](https://github.com/pixeloven/no-mistakes/issues/955)) ([911452b](https://github.com/pixeloven/no-mistakes/commit/911452b00f942f80238e3c6cc35b8c185146cae8))
+* **pipeline:** give CI repairs the recorded decision history ([#976](https://github.com/pixeloven/no-mistakes/issues/976)) ([7808aea](https://github.com/pixeloven/no-mistakes/commit/7808aeae2702f301b6da4a7cd39935c0adaaf5fe))
+* **pipeline:** isolate review agent timeout budgets ([#962](https://github.com/pixeloven/no-mistakes/issues/962)) ([8a82308](https://github.com/pixeloven/no-mistakes/commit/8a82308ded6e3de2e0e574ed3d89424e151b3df4))
+* **pipeline:** never report a CI approval override as a clean pass ([#923](https://github.com/pixeloven/no-mistakes/issues/923)) ([76fa092](https://github.com/pixeloven/no-mistakes/commit/76fa0921a9797b09e120c8b5979c4d0e65f88922))
+* **pipeline:** require intended-usage evidence for review findings ([#948](https://github.com/pixeloven/no-mistakes/issues/948)) ([f9415ab](https://github.com/pixeloven/no-mistakes/commit/f9415ab1db06a739961e09ed18256e0bd7378806))
+* **pipeline:** retry invalid test analyzer findings ([#1014](https://github.com/pixeloven/no-mistakes/issues/1014)) ([42497f8](https://github.com/pixeloven/no-mistakes/commit/42497f8412214d8f37ed3d0ce807a6ea3692e8e0))
+* preserve delivery recovery across upstream v1.72 ([8a0e0c7](https://github.com/pixeloven/no-mistakes/commit/8a0e0c762248adfd0d037c30b9667cb92c0d7364))
+* publish update channels after automated releases ([#1024](https://github.com/pixeloven/no-mistakes/issues/1024)) ([53ceb81](https://github.com/pixeloven/no-mistakes/commit/53ceb81ea6920e449684c2d0c275006e7ed99e8c))
+* reject stale shared signing configuration ([75d813e](https://github.com/pixeloven/no-mistakes/commit/75d813efde333bd26304401e2f2db947427b2897))
+* **update:** fetch version metadata from release CDN ([#1007](https://github.com/pixeloven/no-mistakes/issues/1007)) ([2db4b7f](https://github.com/pixeloven/no-mistakes/commit/2db4b7f19224bde17018ebfcd38bbe56bd9486f4))
+
 ## [1.60.2](https://github.com/pixeloven/no-mistakes/compare/v1.60.1...v1.60.2) (2026-08-31)
 
 
