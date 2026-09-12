@@ -43,3 +43,24 @@ func TestCIWorkflowUsesRaceTestsOnUnixRunners(t *testing.T) {
 		t.Fatalf("Unix-only go test -race ./... commands = %d, want 1; normalized commands: %#v", len(raceTests), commands)
 	}
 }
+
+// TestCIWorkflowMakesForkSafetyAncestryAvailable reproduces the Linux/macOS
+// PR failure where the root ancestry regression ran in checkout's default
+// depth-1 clone: verify-fork-safety correctly refused because PR 11's commit
+// object was absent. The whole test job needs the real graph so that positive
+// ancestry means retained history rather than an environment-dependent skip.
+func TestCIWorkflowMakesForkSafetyAncestryAvailable(t *testing.T) {
+	job := ciTestJob(t)
+	var checkouts []wfStep
+	for _, step := range job.Steps {
+		if step.Uses == "actions/checkout@v6" {
+			checkouts = append(checkouts, step)
+		}
+	}
+	if len(checkouts) != 1 {
+		t.Fatalf("test job checkout steps = %d, want 1", len(checkouts))
+	}
+	if got := checkouts[0].With["fetch-depth"]; got != "0" {
+		t.Fatalf("test job checkout fetch-depth = %q, want 0 so fork ancestry is available", got)
+	}
+}
